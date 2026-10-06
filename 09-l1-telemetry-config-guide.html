@@ -1,0 +1,1120 @@
+<!doctype html><html><head><meta charset='utf-8'><style>
+@page { size: A4; margin: 16mm 14mm; }
+body { font-family: Helvetica, Arial, sans-serif; font-size: 10.5pt; color: #111; line-height: 1.38; }
+h1 { font-size: 22pt; color: #0B3D91; border-bottom: 3px solid #F46800; padding-bottom: 4px; }
+h2 { font-size: 15pt; color: #0B3D91; margin-top: 26px; page-break-after: avoid; }
+h3 { font-size: 12pt; color: #333; margin-top: 18px; page-break-after: avoid; }
+table { border-collapse: collapse; width: 100%; margin: 8px 0 14px; font-size: 9pt; page-break-inside: auto; }
+th, td { border: 1px solid #C9CDD3; padding: 4px 6px; vertical-align: top; text-align: left; }
+th { background: #EEF2F7; }
+tr { page-break-inside: avoid; }
+code { font-family: Menlo, Consolas, monospace; font-size: 8.6pt; background: #F3F4F6; padding: 1px 3px; border-radius: 3px; }
+pre { background: #0F172A; color: #E2E8F0; padding: 10px 12px; border-radius: 6px; font-size: 7.6pt; line-height: 1.25; overflow: hidden; white-space: pre; page-break-inside: avoid; }
+pre code { background: none; color: inherit; font-size: inherit; padding: 0; }
+blockquote { border-left: 4px solid #F46800; margin: 10px 0; padding: 6px 12px; background: #FFF7ED; color: #333; }
+img.diagram { display: block; max-width: 100%; max-height: 240mm; margin: 10px auto 6px; page-break-inside: avoid; }
+figcaption { text-align: center; font-size: 8.5pt; color: #666; margin-bottom: 14px; }
+hr { border: 0; border-top: 1px solid #DDD; margin: 20px 0; }
+.cover { text-align: center; margin-top: 140px; page-break-after: always; }
+.cover h1 { border: 0; font-size: 30pt; }
+.cover p { color: #555; font-size: 12pt; }
+</style></head><body><div class="cover"><h1>L1 Engineer's Guide #2 — Tempo · Mimir · Loki · Span-Metrics</h1><p>Terminology, config files and the step-by-step process for Java / .NET / Python apps on VMs and EKS</p><p>Trace3 Delivery — Pacific Life AppDynamics Exit</p></div><h1>L1 Engineer's Guide #2 — Tempo, Mimir, Loki &amp; Span-Metrics: terminology, config files, and the step-by-step process for Java / .NET / Python on VMs and EKS</h1>
+<blockquote>
+<p>Companion to Guide #1 (<code>08-l1-engineer-guide.md</code>). Guide #1 explained the <em>why</em> and the big picture. This one is the <em>how</em>: what each backend is, what its config looks like, which lines matter, and the exact order of steps to get one application's traces, metrics and logs flowing — for each runtime, on a VM or on EKS.</p>
+</blockquote>
+<hr />
+<h2>1. Terminology you will meet in the config files</h2>
+<h3>1.1 Signals and protocol</h3>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+<th>Where you see it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Signal</strong></td>
+<td>One of the three telemetry types: <strong>traces</strong>, <strong>metrics</strong>, <strong>logs</strong>. Every Alloy component declares which signals it handles (<code>output { traces = […] metrics = […] logs = […] }</code>).</td>
+<td>Alloy configs</td>
+</tr>
+<tr>
+<td><strong>OTLP</strong></td>
+<td>OpenTelemetry Protocol. gRPC on <strong>4317</strong>, HTTP/protobuf on <strong>4318</strong>. Carries all three signals.</td>
+<td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code>, <code>otelcol.receiver.otlp</code></td>
+</tr>
+<tr>
+<td><strong>Resource</strong></td>
+<td>"Who is sending": a set of attributes attached to <em>everything</em> a process emits. Key ones: <code>service.name</code>, <code>service.namespace</code>, <code>deployment.environment</code>, <code>app.id</code>, <code>host.name</code>, <code>k8s.pod.name</code>.</td>
+<td><code>OTEL_RESOURCE_ATTRIBUTES</code>, <code>context = "resource"</code> in OTTL</td>
+</tr>
+<tr>
+<td><strong>Span</strong></td>
+<td>One timed operation. Fields: <code>name</code>, <code>kind</code> (SERVER / CLIENT / CONSUMER / PRODUCER / INTERNAL), <code>status</code> (UNSET / OK / ERROR), <code>attributes</code>, <code>trace_id</code>, <code>span_id</code>, <code>parent_span_id</code>.</td>
+<td>Tempo, OTTL <code>context = "span"</code></td>
+</tr>
+<tr>
+<td><strong>Root span / entry span</strong></td>
+<td>The first span of a trace inside a service — a SERVER span for HTTP, CONSUMER for a queue. <strong>This is what AppD called a Business Transaction entry point.</strong></td>
+<td>BT rules target <code>kind == SPAN_KIND_SERVER</code></td>
+</tr>
+<tr>
+<td><strong>Semantic conventions (semconv)</strong></td>
+<td>The agreed attribute names. They changed in 2023: old <code>http.target</code>/<code>http.status_code</code>/<code>http.url</code> → new <code>url.path</code>/<code>http.response.status_code</code>/<code>url.full</code>. <strong>Agents of different versions emit different names.</strong> Our pipeline normalises old → new (<code>enrich</code> block).</td>
+<td><code>alloy/eks/config.alloy</code></td>
+</tr>
+<tr>
+<td><strong>Instrumentation scope</strong></td>
+<td>Which library produced the span (e.g. <code>io.opentelemetry.tomcat-10.0</code>, <code>opentelemetry.instrumentation.flask</code>). Useful to see <em>which</em> auto-instrumentation fired.</td>
+<td>Tempo span details</td>
+</tr>
+<tr>
+<td><strong>Exemplar</strong></td>
+<td>A trace_id attached to a metric sample so you can jump from a latency histogram bucket straight to an example trace.</td>
+<td>Tempo metrics-generator <code>send_exemplars: true</code>, Grafana "exemplars" toggle</td>
+</tr>
+<tr>
+<td><strong>Baggage</strong></td>
+<td>Key/values propagated across services with the trace context. Rarely needed here.</td>
+<td>—</td>
+</tr>
+<tr>
+<td><strong>W3C <code>traceparent</code></strong></td>
+<td>The HTTP header that carries trace context between services. All three agents use it by default — that is how one trace spans Java → .NET → Python.</td>
+<td>HTTP headers</td>
+</tr>
+</tbody>
+</table>
+<h3>1.2 Backends in Grafana Cloud</h3>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+<th>Config surface</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Tempo</strong></td>
+<td>Trace store. Write path: OTLP in. Read path: <strong>TraceQL</strong>. Has the <strong>metrics-generator</strong>.</td>
+<td>Grafana Cloud: portal toggles. Self-hosted: <code>tempo.yaml</code></td>
+</tr>
+<tr>
+<td><strong>Metrics-generator</strong></td>
+<td>Tempo component that derives metrics from spans <strong>as they arrive</strong>: <code>span-metrics</code> processor (RED per service/span name) and <code>service-graphs</code> processor (edges between services). Writes to Mimir via remote-write.</td>
+<td><code>metrics_generator:</code> + <code>overrides: … processors: [span-metrics, service-graphs]</code></td>
+</tr>
+<tr>
+<td><strong>Span-metrics</strong></td>
+<td>The metric series the generator writes: <code>traces_spanmetrics_calls_total</code>, <code>traces_spanmetrics_latency_bucket/_sum/_count</code>, <code>traces_spanmetrics_size_total</code>. Labels: <code>service</code>, <code>span_name</code>, <code>span_kind</code>, <code>status_code</code> + any configured <code>dimensions</code>. <strong>= AppD BT metrics.</strong></td>
+<td>Mimir</td>
+</tr>
+<tr>
+<td><strong>Service graph metrics</strong></td>
+<td><code>traces_service_graph_request_total</code>, <code>…_failed_total</code>, <code>…_server_seconds_bucket</code> with <code>client</code>/<code>server</code> labels. Powers the service map (= AppD flow map).</td>
+<td>Mimir</td>
+</tr>
+<tr>
+<td><strong>Mimir</strong></td>
+<td>Prometheus-compatible, horizontally scalable metrics store. Query language <strong>PromQL</strong>. Receives: span-metrics (from Tempo), host/runtime metrics (from Alloy), OTLP metrics (from agents).</td>
+<td>Grafana Cloud: managed; you control <em>what you send</em> and limits/cardinality</td>
+</tr>
+<tr>
+<td><strong>Remote write</strong></td>
+<td>The Prometheus push protocol Alloy and Tempo use to write into Mimir.</td>
+<td><code>prometheus.remote_write</code>, Tempo <code>storage.remote_write</code></td>
+</tr>
+<tr>
+<td><strong>Cardinality</strong></td>
+<td>Number of distinct label combinations per metric. <code>span_name</code> with raw IDs (<code>/api/quote/123</code>) explodes cardinality and cost. The pipeline's global guard rewrites <code>/123</code> → <code>/{id}</code>.</td>
+<td>Mimir limits (<code>max_global_series_per_user</code>), Alloy BT rules</td>
+</tr>
+<tr>
+<td><strong>Loki</strong></td>
+<td>Log store. Indexes <strong>labels</strong> (few, low-cardinality) and keeps everything else as <strong>structured metadata</strong> or in the line. Query language <strong>LogQL</strong>. OTLP ingest endpoint <code>/otlp</code>.</td>
+<td>Grafana Cloud: managed; OTLP resource-attribute → label mapping configurable</td>
+</tr>
+<tr>
+<td><strong>Label vs structured metadata (Loki)</strong></td>
+<td>Labels = indexed stream identity (<code>service_name</code>, <code>deployment_environment</code>, <code>app_id</code>). Structured metadata = per-line key/values not indexed (<code>trace_id</code>, <code>span_id</code>, <code>severity</code>). Putting <code>trace_id</code> in a <em>label</em> would be a cardinality disaster.</td>
+<td>Loki <code>otlp_config</code></td>
+</tr>
+<tr>
+<td><strong>TraceQL / PromQL / LogQL</strong></td>
+<td>Query languages for Tempo / Mimir / Loki. Cheatsheet in §8.</td>
+<td>Grafana Explore</td>
+</tr>
+<tr>
+<td><strong>Application Observability</strong></td>
+<td>Grafana Cloud app that reads span-metrics + service-graph metrics and shows RED per service/operation and the service map. Needs <code>service.namespace</code> set (= our <code>app.id</code>).</td>
+<td>Grafana Cloud UI</td>
+</tr>
+<tr>
+<td><strong>Data source UID</strong></td>
+<td>Stable ID Grafana uses to reference Tempo/Mimir/Loki in dashboards and alert rules. Terraform needs them.</td>
+<td><code>prometheus_datasource_uid</code>, etc.</td>
+</tr>
+</tbody>
+</table>
+<h3>1.3 Alloy / collector terms</h3>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Component</strong></td>
+<td>One block in a <code>.alloy</code> file: <code>otelcol.receiver.otlp "ingress" { … }</code>. Type + label. Components reference each other by <code>type.label.export</code> (e.g. <code>otelcol.processor.batch.export.input</code>).</td>
+</tr>
+<tr>
+<td><strong>Receiver / Processor / Exporter / Connector</strong></td>
+<td>Receive telemetry in → transform it → send it out. A <strong>connector</strong> is both exporter and receiver (e.g. <code>otelcol.connector.spanmetrics</code> consumes traces and emits metrics).</td>
+</tr>
+<tr>
+<td><strong>OTTL statement</strong></td>
+<td><code>function(args) where condition</code>. <code>set</code>, <code>delete_key</code>, <code>replace_pattern</code>, <code>replace_all_patterns</code>, <code>Concat</code>, <code>ExtractPatterns</code>, <code>IsMatch</code>. Runs in a <code>context</code> (<code>resource</code>, <code>span</code>, <code>log</code>, <code>metric</code>).</td>
+</tr>
+<tr>
+<td><strong><code>error_mode = "ignore"</code></strong></td>
+<td>A statement that errors (e.g. attribute missing) is skipped instead of dropping the batch. Always set it.</td>
+</tr>
+<tr>
+<td><strong>Tail sampling</strong></td>
+<td>Hold complete traces for <code>decision_wait</code>, then keep/drop by policy. Requires all spans of a trace to reach the <em>same</em> collector replica (load-balance by trace ID when &gt;1 replica).</td>
+</tr>
+<tr>
+<td><strong>Head sampling</strong></td>
+<td>Decide at the <em>agent</em> when the trace starts (<code>OTEL_TRACES_SAMPLER</code>). We set <code>parentbased_always_on</code> so the pipeline decides.</td>
+</tr>
+<tr>
+<td><strong>Batch processor</strong></td>
+<td>Buffers and sends in chunks; always the last processor before exporters.</td>
+</tr>
+<tr>
+<td><strong>Memory limiter</strong></td>
+<td>First processor; refuses data when the pod is near its memory limit instead of crashing.</td>
+</tr>
+<tr>
+<td><strong>DaemonSet</strong> (EKS)</td>
+<td>One Alloy pod per worker node — the Kubernetes equivalent of "host Alloy". Apps send to the node-local pod via <code>hostPort</code> or to a cluster <code>Service</code>.</td>
+</tr>
+<tr>
+<td><strong>OTel Operator / Instrumentation CR</strong> (EKS)</td>
+<td>Kubernetes operator that injects the Java/.NET/Python agent into pods based on an annotation. Alternative to baking the agent into images.</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>2. Where the pieces run — VM vs EKS</h2>
+<h3>2.1 Apps on VMs (on-prem or EC2)</h3>
+<figure><img class="diagram" src="img/10-vm-datapath.png"><figcaption>10 vm datapath</figcaption></figure>
+
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Linux VM</th>
+<th>Windows VM</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Agent config</td>
+<td><code>OTEL_*</code> env vars in systemd unit / <code>setenv.sh</code> / launch script</td>
+<td>Machine-level or IIS app-pool environment variables (<code>[Environment]::SetEnvironmentVariable(..., 'Machine')</code>)</td>
+</tr>
+<tr>
+<td>Local collector</td>
+<td>Host Alloy as systemd service, listens <code>127.0.0.1:4317/4318</code></td>
+<td>Host Alloy as Windows service, same ports</td>
+</tr>
+<tr>
+<td>Logs</td>
+<td>Alloy tails files (<code>local.file_match</code> + <code>loki.source.file</code>) <em>or</em> agent sends OTLP logs</td>
+<td>Alloy <code>loki.source.windowsevent</code> or file tail, <em>or</em> agent OTLP logs</td>
+</tr>
+<tr>
+<td>Host metrics</td>
+<td><code>prometheus.exporter.unix</code></td>
+<td><code>prometheus.exporter.windows</code></td>
+</tr>
+<tr>
+<td>Upstream</td>
+<td>OTLP/TLS → regional pipeline NLB</td>
+<td>same</td>
+</tr>
+</tbody>
+</table>
+<h3>2.2 Apps on EKS</h3>
+<figure><img class="diagram" src="img/11-eks-datapath.png"><figcaption>11 eks datapath</figcaption></figure>
+
+<table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>How</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Agent config</td>
+<td>Env vars in the <code>Deployment</code> (<code>env:</code>), agent delivered by (a) baking into the image, (b) init-container copying the jar/profiler into a shared volume, or (c) <strong>OTel Operator</strong> injection via pod annotation</td>
+</tr>
+<tr>
+<td>Local collector</td>
+<td><strong>Alloy DaemonSet</strong> (Helm chart <code>grafana/alloy</code>, <code>controller.type: daemonset</code>), OTLP receiver exposed via <code>hostPort</code> 4317 — apps use <code>OTEL_EXPORTER_OTLP_ENDPOINT=http://$(HOST_IP):4317</code> with <code>HOST_IP</code> from <code>status.hostIP</code></td>
+</tr>
+<tr>
+<td>Enrichment</td>
+<td><code>otelcol.processor.k8sattributes</code> adds <code>k8s.namespace.name</code>, <code>k8s.pod.name</code>, <code>k8s.deployment.name</code>; <code>app.id</code> comes from a pod label (<code>app.pacificlife.com/app-id</code>) mapped to a resource attribute</td>
+</tr>
+<tr>
+<td>Logs</td>
+<td>DaemonSet tails <code>/var/log/pods/**</code> (<code>loki.source.kubernetes</code> or file match) — agent OTLP logs also work</td>
+</tr>
+<tr>
+<td>Metrics</td>
+<td>kubelet / cAdvisor / kube-state-metrics via <code>prometheus.scrape</code>; runtime metrics (JVM, CLR, Python) via agent OTLP</td>
+</tr>
+<tr>
+<td>Upstream</td>
+<td>DaemonSet → regional pipeline (same OTLP/TLS)</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>3. Tempo — config and what matters</h2>
+<h3>3.1 Grafana Cloud (what Pacific Life has)</h3>
+<p>You do not run Tempo; you configure it. The items that must be true before any app is migrated:</p>
+<table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Where</th>
+<th>Must be</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Metrics-generator: <strong>span-metrics</strong> processor</td>
+<td>Grafana Cloud portal → stack → Tempo → <em>Configure</em> → Metrics-generator</td>
+<td><strong>Enabled</strong> on prod <em>and</em> non-prod stacks (Discovery Q9)</td>
+</tr>
+<tr>
+<td>Metrics-generator: <strong>service-graphs</strong> processor</td>
+<td>same</td>
+<td>Enabled (needed for service map / App O11y)</td>
+</tr>
+<tr>
+<td>Span-metrics dimensions</td>
+<td>same (or support ticket)</td>
+<td>Defaults (<code>service</code>, <code>span_name</code>, <code>span_kind</code>, <code>status_code</code>) are enough for BT parity; optional extra: <code>bt.source</code>, <code>http.request.method</code></td>
+</tr>
+<tr>
+<td>Histogram buckets</td>
+<td>default <code>[2ms … 15s]</code></td>
+<td>Default is fine; note p95 precision depends on buckets</td>
+</tr>
+<tr>
+<td>Ingest limits (bytes/s, traces/s)</td>
+<td>portal → Tempo → limits</td>
+<td>Sized for 10 apps (Discovery Q11)</td>
+</tr>
+<tr>
+<td>Trace retention</td>
+<td>portal</td>
+<td>Default 30 days; confirm</td>
+</tr>
+</tbody>
+</table>
+<p><strong>How to verify (the only test that matters):</strong> in Explore → Mimir run
+<code>count(count by (service) (traces_spanmetrics_calls_total))</code> — if it returns a number, the generator is on. If "no data" with traces present in Tempo → generator off.</p>
+<h3>3.2 Self-hosted reference (<code>lab/tempo/tempo.yaml</code>) — annotated</h3>
+<pre><code class="language-yaml">server:
+  http_listen_port: 3200                 # Tempo API / Grafana datasource URL
+
+distributor:
+  receivers:                             # what Tempo accepts; we send OTLP from Alloy
+    otlp:
+      protocols:
+        grpc: { endpoint: 0.0.0.0:4317 }
+        http: { endpoint: 0.0.0.0:4318 }
+
+ingester:
+  max_block_duration: 5m                 # how often in-memory traces are cut into blocks
+
+compactor:
+  compaction:
+    block_retention: 24h                 # trace retention (Grafana Cloud: portal setting)
+
+storage:
+  trace:
+    backend: local                       # Grafana Cloud: object storage, managed
+    wal:   { path: /var/tempo/wal }
+    local: { path: /var/tempo/blocks }
+
+metrics_generator:                       # &lt;&lt;&lt; THE PART THAT MAKES BT METRICS
+  registry:
+    external_labels: { source: tempo }   # label added to every generated series
+  storage:
+    path: /var/tempo/generator/wal
+    remote_write:                        # where the metrics go = Mimir / Prometheus
+      - url: http://prometheus:9090/api/v1/write
+        send_exemplars: true             # attach trace_ids to histogram samples
+  processor:
+    span_metrics:
+      dimensions: [http.request.method, bt.source]   # extra labels from span attributes (keep few!)
+      intrinsic_dimensions:
+        service: true                    # -&gt; label &quot;service&quot;
+        span_name: true                  # -&gt; label &quot;span_name&quot;   (= BT name after OTTL)
+        span_kind: true
+        status_code: true                # STATUS_CODE_OK / ERROR / UNSET
+      # histogram_buckets: [0.002, 0.004, … 15]   # override only with a reason
+
+overrides:
+  defaults:
+    metrics_generator:
+      processors: [service-graphs, span-metrics, local-blocks]   # enable per tenant
+</code></pre>
+<p>What each processor gives you:</p>
+<table>
+<thead>
+<tr>
+<th>Processor</th>
+<th>Produces</th>
+<th>AppD equivalent</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>span-metrics</code></td>
+<td><code>traces_spanmetrics_*</code> per <code>service</code> × <code>span_name</code></td>
+<td>BT calls/min, errors/min, response time</td>
+</tr>
+<tr>
+<td><code>service-graphs</code></td>
+<td><code>traces_service_graph_request_*</code> client→server edges</td>
+<td>Flow map / tier dependencies</td>
+</tr>
+<tr>
+<td><code>local-blocks</code></td>
+<td>Lets TraceQL metrics queries (<code>{…} | rate()</code>) run over recent data</td>
+<td>Ad-hoc BT analytics</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>4. Mimir — span-metrics, PromQL, limits</h2>
+<h3>4.1 What arrives in Mimir for one app</h3>
+<table>
+<thead>
+<tr>
+<th>Source</th>
+<th>Metric family</th>
+<th>Example series</th>
+<th>Sent by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tempo generator</td>
+<td><code>traces_spanmetrics_calls_total</code></td>
+<td><code>{service="app01-quote-api", span_name="BT:quote", span_kind="SPAN_KIND_SERVER", status_code="STATUS_CODE_OK", source="tempo"}</code></td>
+<td>Tempo</td>
+</tr>
+<tr>
+<td>Tempo generator</td>
+<td><code>traces_spanmetrics_latency_bucket</code> / <code>_sum</code> / <code>_count</code></td>
+<td><code>{…, le="0.5"}</code></td>
+<td>Tempo</td>
+</tr>
+<tr>
+<td>Tempo generator</td>
+<td><code>traces_service_graph_request_total</code></td>
+<td><code>{client="app01-quote-api", server="rating-svc"}</code></td>
+<td>Tempo</td>
+</tr>
+<tr>
+<td>Agent (OTLP metrics)</td>
+<td>JVM: <code>jvm_memory_used_bytes</code>, <code>jvm_gc_duration_seconds</code>, <code>jvm_thread_count</code>; .NET: <code>process_runtime_dotnet_gc_*</code>, <code>http_server_request_duration_seconds</code>; Python: <code>http_server_duration</code></td>
+<td><code>{service_name="app01-quote-api", app_id="APP-01", …}</code></td>
+<td>Alloy pipeline (<code>metrics</code> path)</td>
+</tr>
+<tr>
+<td>Host Alloy</td>
+<td><code>node_cpu_seconds_total</code>, <code>node_memory_*</code>, <code>windows_*</code></td>
+<td><code>{instance="vm-prd-01", app_id="APP-01"}</code></td>
+<td>Host Alloy remote-write</td>
+</tr>
+<tr>
+<td>EKS DaemonSet</td>
+<td><code>container_cpu_usage_seconds_total</code>, <code>kube_pod_status_*</code></td>
+<td><code>{namespace, pod}</code></td>
+<td>DaemonSet</td>
+</tr>
+</tbody>
+</table>
+<p>Note the label-name difference: Tempo-generated series use <code>service</code>; OTLP-metrics series use <code>service_name</code> (dots become underscores). Dashboards must use the right one.</p>
+<h3>4.2 PromQL cookbook (copy these)</h3>
+<pre><code class="language-promql"># Calls/min for every BT of one service (AppD &quot;Calls per minute&quot;)
+sum by (span_name) (rate(traces_spanmetrics_calls_total{service=&quot;app01-quote-api&quot;}[5m])) * 60
+
+# Error % per BT (AppD &quot;Errors per minute&quot; as a ratio)
+  sum by (span_name) (rate(traces_spanmetrics_calls_total{service=&quot;app01-quote-api&quot;, status_code=&quot;STATUS_CODE_ERROR&quot;}[5m]))
+/ sum by (span_name) (rate(traces_spanmetrics_calls_total{service=&quot;app01-quote-api&quot;}[5m])) * 100
+
+# p95 latency per BT in ms (AppD &quot;95th percentile response time&quot;)
+histogram_quantile(0.95, sum by (le, span_name) (rate(traces_spanmetrics_latency_bucket{service=&quot;app01-quote-api&quot;}[5m]))) * 1000
+
+# Average response time per BT (AppD &quot;Average response time&quot;)
+  sum by (span_name) (rate(traces_spanmetrics_latency_sum{service=&quot;app01-quote-api&quot;}[5m]))
+/ sum by (span_name) (rate(traces_spanmetrics_latency_count{service=&quot;app01-quote-api&quot;}[5m])) * 1000
+
+# All BTs of an APP_ID (service.namespace is copied from app.id by the pipeline)
+sum by (service, span_name) (rate(traces_spanmetrics_calls_total{service_namespace=&quot;APP-01&quot;}[5m])) * 60
+
+# Downstream dependencies (AppD flow map edge)
+sum by (client, server) (rate(traces_service_graph_request_total{client=&quot;app01-quote-api&quot;}[5m]))
+
+# Is the metrics-generator alive for this service? (should be &gt; 0 when traffic exists)
+count(traces_spanmetrics_calls_total{service=&quot;app01-quote-api&quot;})
+
+# Cardinality check: how many distinct span names does a service have? (&gt;100 = fix BT rules)
+count(count by (span_name) (traces_spanmetrics_calls_total{service=&quot;app01-quote-api&quot;}))
+</code></pre>
+<h3>4.3 Limits you can hit (Grafana Cloud)</h3>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Limit</th>
+<th>Fix</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>429</code> / "per-user series limit" in pipeline or Tempo logs</td>
+<td><code>max_global_series_per_user</code></td>
+<td>Reduce <code>dimensions</code>; fix span-name cardinality; raise limit (cost)</td>
+</tr>
+<tr>
+<td>Samples rejected "out of order"</td>
+<td>multiple writers same series</td>
+<td>One Tempo generator per stack; don't also run the Alloy spanmetrics connector <em>and</em> Tempo generator for the same traffic</td>
+</tr>
+<tr>
+<td>Alert rule "no data"</td>
+<td>query uses <code>service_name</code> instead of <code>service</code> (or vice-versa)</td>
+<td>Check label names in Explore first</td>
+</tr>
+</tbody>
+</table>
+<h3>4.4 Optional: recording rules (pre-computed RED)</h3>
+<p>If dashboards for 343 apps get slow, pre-compute per-BT RED with Mimir recording rules (Terraform <code>grafana_rule_group</code> with <code>record</code> blocks, or Mimir ruler YAML):</p>
+<pre><code class="language-yaml">groups:
+  - name: appd-exit-red
+    interval: 1m
+    rules:
+      - record: bt:calls_per_min:rate5m
+        expr: sum by (service, span_name) (rate(traces_spanmetrics_calls_total[5m])) * 60
+      - record: bt:error_ratio:rate5m
+        expr: |
+            sum by (service, span_name) (rate(traces_spanmetrics_calls_total{status_code=&quot;STATUS_CODE_ERROR&quot;}[5m]))
+          / sum by (service, span_name) (rate(traces_spanmetrics_calls_total[5m]))
+      - record: bt:latency_p95_seconds:rate5m
+        expr: histogram_quantile(0.95, sum by (le, service, span_name) (rate(traces_spanmetrics_latency_bucket[5m])))
+</code></pre>
+<hr />
+<h2>5. Loki — labels, OTLP ingest, correlation</h2>
+<h3>5.1 Two ways logs reach Loki</h3>
+<table>
+<thead>
+<tr>
+<th>Path</th>
+<th>When to use</th>
+<th>trace_id correlation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Agent → OTLP logs</strong> (Java logback/log4j appender, .NET ILogger, Python logging)</td>
+<td>App logs through a standard framework; you want structured logs with <code>trace_id</code> for free</td>
+<td>Automatic — agent sets <code>trace_id</code>/<code>span_id</code> on each record</td>
+</tr>
+<tr>
+<td><strong>Alloy tails log files</strong> (<code>loki.source.file</code>, <code>loki.source.kubernetes</code>)</td>
+<td>Legacy apps, third-party processes, when the OTLP log bridge is not enabled</td>
+<td>Only if the app writes <code>trace_id</code> into the line (enable MDC injection: Java <code>OTEL_INSTRUMENTATION_COMMON_MDC_RESOURCE_ATTRIBUTES</code>, Python <code>OTEL_PYTHON_LOG_CORRELATION=true</code>) and Loki derived field parses it</td>
+</tr>
+</tbody>
+</table>
+<h3>5.2 Which resource attributes become Loki labels</h3>
+<p>Grafana Cloud Loki OTLP ingest promotes a default set to <strong>labels</strong>: <code>service.name</code>, <code>service.namespace</code>, <code>service.instance.id</code>, <code>deployment.environment</code>, <code>cloud.*</code>, <code>k8s.namespace.name</code>, <code>k8s.pod.name</code>, <code>k8s.container.name</code>, … (dots → underscores: <code>service_name</code>). Everything else (incl. <code>trace_id</code>, <code>span_id</code>, <code>severity_text</code>) becomes <strong>structured metadata</strong>. To add <code>app.id</code> as a label, self-hosted config is:</p>
+<pre><code class="language-yaml"># loki.yaml (self-hosted reference; in Grafana Cloud this is a tenant setting / support request)
+limits_config:
+  allow_structured_metadata: true
+  otlp_config:
+    resource_attributes:
+      attributes_config:
+        - action: index_label
+          attributes: [app.id, deployment.environment, service.name, service.namespace]
+    log_attributes:
+      - action: structured_metadata
+        attributes: [trace_id, span_id, code.function]
+</code></pre>
+<p>Rule of thumb: <strong>≤ 10 labels, none with unbounded values.</strong> <code>trace_id</code> is never a label.</p>
+<h3>5.3 LogQL cookbook</h3>
+<pre><code class="language-logql"># All logs for a service with a trace id present
+{service_name=&quot;app01-quote-api&quot;} |= &quot;trace_id&quot;
+
+# Errors for one APP_ID (if app_id is a label) — otherwise filter on structured metadata
+{app_id=&quot;APP-01&quot;} | detected_level=&quot;error&quot;
+{service_name=&quot;app01-quote-api&quot;} | severity_text=&quot;ERROR&quot;
+
+# Jump from a trace to its logs (Grafana does this via tracesToLogsV2; manual form):
+{service_name=&quot;app01-quote-api&quot;} | trace_id=&quot;74aefd2dcd81f81946bd5a03d1201e35&quot;
+
+# Redaction evidence for FPC §8
+{service_name=&quot;app05-claims-portal&quot;} |= &quot;[SSN]&quot;
+
+# Log-based rate (rarely needed — span-metrics are the primary RED source)
+sum by (service_name) (rate({app_id=&quot;APP-01&quot;} | detected_level=&quot;error&quot; [5m]))
+</code></pre>
+<hr />
+<h2>6. Span-metrics — generator vs in-pipeline connector</h2>
+<figure><img class="diagram" src="img/12-spanmetrics.png"><figcaption>12 spanmetrics</figcaption></figure>
+
+<p>Two places can turn spans into metrics. Pick <strong>one</strong> per stream.</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Tempo metrics-generator (default)</th>
+<th><code>otelcol.connector.spanmetrics</code> in Alloy pipeline</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Where</td>
+<td>Inside Grafana Cloud, after ingest</td>
+<td>Inside the EKS pipeline, <strong>before</strong> tail sampling</td>
+</tr>
+<tr>
+<td>Counts</td>
+<td>Only traces that survived sampling</td>
+<td><strong>Every</strong> span (exact AppD-style counts)</td>
+</tr>
+<tr>
+<td>Config owner</td>
+<td>Pacific Life (portal)</td>
+<td>Trace3 PR to pipeline repo</td>
+</tr>
+<tr>
+<td>Cost</td>
+<td>Tempo ingest + Mimir series</td>
+<td>Mimir series only (traces can be sampled harder)</td>
+</tr>
+<tr>
+<td>Extra dimensions</td>
+<td>Portal setting</td>
+<td>Any attribute, per-rule</td>
+</tr>
+<tr>
+<td>Recommendation</td>
+<td>Start here (zero pipeline change)</td>
+<td>Enable if Pacific Life needs exact counts or chooses aggressive sampling (Q11 decision)</td>
+</tr>
+</tbody>
+</table>
+<p>In-pipeline connector (drop into <code>alloy/eks/config.alloy</code>; wire <code>enrich/bt_rules</code> output → connector input, connector metrics → batch):</p>
+<pre><code class="language-alloy">otelcol.connector.spanmetrics &quot;bt&quot; {
+  histogram {
+    explicit {
+      buckets = [&quot;2ms&quot;, &quot;5ms&quot;, &quot;10ms&quot;, &quot;25ms&quot;, &quot;50ms&quot;, &quot;100ms&quot;, &quot;250ms&quot;, &quot;500ms&quot;, &quot;1s&quot;, &quot;2s&quot;, &quot;5s&quot;, &quot;10s&quot;, &quot;15s&quot;]
+    }
+  }
+  dimension { name = &quot;http.request.method&quot; }
+  dimension { name = &quot;bt.source&quot; }
+  dimension { name = &quot;deployment.environment&quot; }
+  namespace                 = &quot;traces.spanmetrics&quot;     // yields traces_spanmetrics_* like Tempo
+  metrics_flush_interval    = &quot;15s&quot;
+  exemplars { enabled = true }
+  output {
+    metrics = [otelcol.processor.batch.export.input]
+  }
+}
+// redact -&gt; [otelcol.connector.spanmetrics.bt.input, otelcol.processor.tail_sampling.default.input]
+</code></pre>
+<p>Whichever you use, the series names and labels match, so dashboards/alerts in <code>terraform/modules/*</code> work unchanged.</p>
+<hr />
+<h2>7. Step-by-step: one application, end to end</h2>
+<p>Use with the Migration Pattern runbook (<code>03-…</code>) and the app's Functional Parity Checklist (FPC). Each step has a <strong>verify</strong> line — do not move on until it passes.</p>
+<h3>Step 0 — Platform prerequisites (once per stack, before any app)</h3>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Action</th>
+<th>Verify</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0.1</td>
+<td>Confirm Tempo metrics-generator (span-metrics + service-graphs) on prod and non-prod</td>
+<td><code>count(traces_spanmetrics_calls_total)</code> returns data for <em>any</em> existing service</td>
+</tr>
+<tr>
+<td>0.2</td>
+<td>Collect data-source UIDs (Mimir, Tempo, Loki) per stack</td>
+<td>Grafana → Connections → Data sources → copy UID</td>
+</tr>
+<tr>
+<td>0.3</td>
+<td>Regional pipeline reachable from app networks; Grafana Cloud OTLP credentials in K8s secret</td>
+<td><code>grpcurl -plaintext &lt;nlb&gt;:4317 list</code> from a VM; pipeline pod logs show no 401</td>
+</tr>
+<tr>
+<td>0.4</td>
+<td>Host Alloy (VM) or Alloy DaemonSet (EKS) present, OTLP receiver enabled</td>
+<td><code>curl -s localhost:12345/-/ready</code> on a VM; <code>kubectl -n observability get ds alloy</code> on EKS</td>
+</tr>
+<tr>
+<td>0.5</td>
+<td>ServiceNow webhook user + non-prod endpoint; Terraform service-account token</td>
+<td><code>terraform plan</code> succeeds in <code>envs/nonprod</code></td>
+</tr>
+</tbody>
+</table>
+<h3>Step 1 — Identity: decide the names (per app)</h3>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Rule</th>
+<th>Example</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>service.name</code></td>
+<td>One per deployable; lowercase, stable across versions</td>
+<td><code>app01-quote-api</code></td>
+</tr>
+<tr>
+<td><code>service.namespace</code></td>
+<td>= <code>APP_ID</code> (pipeline copies from <code>app.id</code> if unset)</td>
+<td><code>APP-01</code></td>
+</tr>
+<tr>
+<td><code>app.id</code></td>
+<td>CMDB APP_ID</td>
+<td><code>APP-01</code></td>
+</tr>
+<tr>
+<td><code>deployment.environment</code></td>
+<td><code>prod</code> / <code>nonprod</code> (match Grafana stack and alert matchers)</td>
+<td><code>nonprod</code></td>
+</tr>
+<tr>
+<td><code>service.version</code></td>
+<td>Build/artifact version</td>
+<td><code>2026.06.3</code></td>
+</tr>
+</tbody>
+</table>
+<p>Write them into FPC header. Everything downstream keys on them.</p>
+<h3>Step 2 — Enable the agent (choose your runtime × hosting)</h3>
+<p><strong>Common env (all runtimes, all hosting):</strong></p>
+<pre><code>OTEL_SERVICE_NAME=app01-quote-api
+OTEL_RESOURCE_ATTRIBUTES=app.id=APP-01,deployment.environment=nonprod,service.namespace=APP-01,service.version=2026.06.3
+OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+OTEL_TRACES_SAMPLER=parentbased_always_on
+OTEL_METRICS_EXPORTER=otlp
+OTEL_LOGS_EXPORTER=otlp
+# VM:  OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317
+# EKS: OTEL_EXPORTER_OTLP_ENDPOINT=http://$(HOST_IP):4317   (HOST_IP from fieldRef status.hostIP)
+</code></pre>
+<h4>2A Java on VM (Linux, systemd / Tomcat)</h4>
+<pre><code class="language-ini"># /etc/systemd/system/app01.service.d/otel.conf
+[Service]
+Environment=&quot;JAVA_TOOL_OPTIONS=-javaagent:/opt/otel/opentelemetry-javaagent.jar&quot;
+Environment=&quot;OTEL_SERVICE_NAME=app01-quote-api&quot;
+Environment=&quot;OTEL_RESOURCE_ATTRIBUTES=app.id=APP-01,deployment.environment=nonprod,service.namespace=APP-01&quot;
+Environment=&quot;OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317&quot;
+Environment=&quot;OTEL_INSTRUMENTATION_LOGBACK_APPENDER_ENABLED=true&quot;
+Environment=&quot;OTEL_INSTRUMENTATION_HTTP_SERVER_CAPTURE_REQUEST_HEADERS=x-channel&quot;
+</code></pre>
+<p><code>sudo systemctl daemon-reload &amp;&amp; sudo systemctl restart app01</code>. (Tomcat: put the same in <code>bin/setenv.sh</code> as <code>CATALINA_OPTS</code>.) Dual-run with AppD: keep the AppD <code>-javaagent</code> too.</p>
+<h4>2B Java on EKS (init-container, no image change)</h4>
+<pre><code class="language-yaml">spec:
+  template:
+    metadata:
+      labels: { app.pacificlife.com/app-id: APP-01 }
+    spec:
+      initContainers:
+        - name: otel-agent
+          image: ghcr.io/open-telemetry/opentelemetry-java-instrumentation/opentelemetry-javaagent:2.9.0  # pin
+          command: [&quot;cp&quot;, &quot;/javaagent.jar&quot;, &quot;/otel/opentelemetry-javaagent.jar&quot;]
+          volumeMounts: [{ name: otel, mountPath: /otel }]
+      containers:
+        - name: app
+          volumeMounts: [{ name: otel, mountPath: /otel }]
+          env:
+            - { name: JAVA_TOOL_OPTIONS, value: &quot;-javaagent:/otel/opentelemetry-javaagent.jar&quot; }
+            - { name: HOST_IP, valueFrom: { fieldRef: { fieldPath: status.hostIP } } }
+            - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: &quot;http://$(HOST_IP):4317&quot; }
+            - { name: OTEL_SERVICE_NAME, value: app01-quote-api }
+            - { name: OTEL_RESOURCE_ATTRIBUTES, value: &quot;app.id=APP-01,deployment.environment=nonprod,service.namespace=APP-01&quot; }
+      volumes: [{ name: otel, emptyDir: {} }]
+</code></pre>
+<p>Alternative with the OTel Operator: annotate the pod <code>instrumentation.opentelemetry.io/inject-java: "true"</code> and define one <code>Instrumentation</code> CR per namespace with the exporter endpoint and resource attributes.</p>
+<h4>2C .NET on VM (Windows, IIS)</h4>
+<pre><code class="language-powershell"># as Administrator — AppD .NET agent must already be uninstalled (one profiler per process)
+Import-Module .\OpenTelemetry.DotNet.Auto.psm1
+Install-OpenTelemetryCore
+Register-OpenTelemetryForIIS                       # sets COR_ENABLE_PROFILING / COR_PROFILER for w3wp
+[Environment]::SetEnvironmentVariable('OTEL_SERVICE_NAME','app06-policy-web','Machine')
+[Environment]::SetEnvironmentVariable('OTEL_RESOURCE_ATTRIBUTES','app.id=APP-06,deployment.environment=nonprod,service.namespace=APP-06','Machine')
+[Environment]::SetEnvironmentVariable('OTEL_EXPORTER_OTLP_ENDPOINT','http://127.0.0.1:4317','Machine')
+[Environment]::SetEnvironmentVariable('OTEL_DOTNET_AUTO_TRACES_ASPNET_INSTRUMENTATION_CAPTURE_REQUEST_HEADERS','x-channel','Machine')
+iisreset
+</code></pre>
+<p>Windows service instead of IIS: <code>Register-OpenTelemetryForWindowsService -WindowsServiceName "PLPolicyWorker"</code>.</p>
+<h4>2D .NET on EKS (Linux container, .NET 6/8)</h4>
+<pre><code class="language-dockerfile">FROM mcr.microsoft.com/dotnet/aspnet:8.0
+ARG OTEL_VERSION=1.9.0
+ADD https://github.com/open-telemetry/opentelemetry-dotnet-instrumentation/releases/download/v${OTEL_VERSION}/otel-dotnet-auto-install.sh /otel-install.sh
+RUN apt-get update &amp;&amp; apt-get install -y unzip curl &amp;&amp; OTEL_DOTNET_AUTO_HOME=/otel sh /otel-install.sh
+ENV OTEL_DOTNET_AUTO_HOME=/otel \
+    CORECLR_ENABLE_PROFILING=1 \
+    CORECLR_PROFILER={918728DD-259F-4A6A-AC2B-B85E1B658318} \
+    CORECLR_PROFILER_PATH=/otel/linux-x64/OpenTelemetry.AutoInstrumentation.Native.so \
+    DOTNET_ADDITIONAL_DEPS=/otel/AdditionalDeps \
+    DOTNET_SHARED_STORE=/otel/store \
+    DOTNET_STARTUP_HOOKS=/otel/net/OpenTelemetry.AutoInstrumentation.StartupHook.dll
+COPY publish/ /app
+WORKDIR /app
+ENTRYPOINT [&quot;dotnet&quot;, &quot;PolicyWeb.dll&quot;]
+</code></pre>
+<p>Set <code>OTEL_*</code> identity/env vars in the Deployment as in 2B. Operator alternative: <code>inject-dotnet: "true"</code>.</p>
+<h4>2E Python on VM (gunicorn, systemd)</h4>
+<pre><code class="language-ini">[Service]
+Environment=&quot;OTEL_SERVICE_NAME=app05-claims-portal&quot;
+Environment=&quot;OTEL_RESOURCE_ATTRIBUTES=app.id=APP-05,deployment.environment=nonprod,service.namespace=APP-05&quot;
+Environment=&quot;OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317&quot;
+Environment=&quot;OTEL_PYTHON_LOG_CORRELATION=true&quot;
+Environment=&quot;OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED=true&quot;
+Environment=&quot;OTEL_PYTHON_EXCLUDED_URLS=^/static/,^/health&quot;
+ExecStart=/opt/app05/.venv/bin/opentelemetry-instrument /opt/app05/.venv/bin/gunicorn app.wsgi:application -w 4 -b 0.0.0.0:8080
+</code></pre>
+<p>Install once: <code>pip install opentelemetry-distro opentelemetry-exporter-otlp &amp;&amp; opentelemetry-bootstrap -a install</code>. gunicorn <code>--preload</code> → add <code>post_fork</code> hook (see <code>agents/python.md</code>).</p>
+<h4>2F Python on EKS</h4>
+<pre><code class="language-dockerfile">FROM python:3.12-slim
+COPY requirements.txt .
+RUN pip install -r requirements.txt opentelemetry-distro opentelemetry-exporter-otlp &amp;&amp; opentelemetry-bootstrap -a install
+COPY . /app
+WORKDIR /app
+CMD [&quot;opentelemetry-instrument&quot;, &quot;gunicorn&quot;, &quot;app.wsgi:application&quot;, &quot;-w&quot;, &quot;4&quot;, &quot;-b&quot;, &quot;0.0.0.0:8080&quot;]
+</code></pre>
+<p>Env vars in the Deployment as in 2B. Operator alternative: <code>inject-python: "true"</code>.</p>
+<p><strong>Verify Step 2 (all variants):</strong></p>
+<pre><code># agent started?   Java: log line &quot;opentelemetry-javaagent - version: 2.x&quot;   .NET: OTEL_DOTNET_AUTO_LOG_DIRECTORY logs   Python: no import errors
+# spans leaving?   host Alloy / DaemonSet log shows otlp receiver accepting; or run otelcol debug exporter in non-prod
+# Tempo:           Explore → Tempo → { resource.service.name = &quot;app01-quote-api&quot; }   → at least one trace within 2 minutes
+</code></pre>
+<h3>Step 3 — Verify the local collector (host Alloy / DaemonSet)</h3>
+<table>
+<thead>
+<tr>
+<th>Check</th>
+<th>VM</th>
+<th>EKS</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Alive</td>
+<td><code>curl -s localhost:12345/-/ready</code> → <code>Alloy is ready.</code></td>
+<td><code>kubectl -n observability get pods -l app.kubernetes.io/name=alloy -o wide</code></td>
+</tr>
+<tr>
+<td>Receiver listening</td>
+<td><code>ss -ltnp \| grep 4317</code></td>
+<td><code>kubectl -n observability logs ds/alloy \| grep 'Starting GRPC server'</code></td>
+</tr>
+<tr>
+<td>Forwarding OK</td>
+<td>Alloy log has no <code>exporter … retry</code> / <code>queue is full</code></td>
+<td>same</td>
+</tr>
+<tr>
+<td>Resource attributes added</td>
+<td>Use <code>otelcol.exporter.debug</code> in non-prod or check a trace in Tempo shows <code>app.id</code>, <code>host.name</code> / <code>k8s.pod.name</code></td>
+<td>same</td>
+</tr>
+</tbody>
+</table>
+<h3>Step 4 — Verify the regional pipeline did its job</h3>
+<p>Open one trace in Tempo and check the SERVER span:</p>
+<table>
+<thead>
+<tr>
+<th>Expect</th>
+<th>Means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>service.namespace = APP-01</code></td>
+<td>enrich worked</td>
+</tr>
+<tr>
+<td>span name is <code>BT:…</code> (or a clean <code>http.route</code>)</td>
+<td>BT rules fired; <code>bt.source</code> attribute says which rule</td>
+</tr>
+<tr>
+<td>no <code>?query=</code> in <code>url.full</code>; no <code>[SSN]</code>-shaped raw data; no <code>authorization</code> header</td>
+<td>redaction worked</td>
+</tr>
+<tr>
+<td>error/slow traces always present, normal traces ~10 %</td>
+<td>tail sampling policy as designed</td>
+</tr>
+</tbody>
+</table>
+<p>If span names are unchanged: check attribute names (<code>url.path</code> vs <code>http.target</code>) — the normalisation block handles known cases; add any new ones there.</p>
+<h3>Step 5 — Verify span-metrics in Mimir</h3>
+<pre><code class="language-promql">sum by (span_name, status_code) (rate(traces_spanmetrics_calls_total{service=&quot;app01-quote-api&quot;}[5m])) * 60
+</code></pre>
+<p>Expect one row per BT. Compare with the AppD BT list from FPC §1: every in-scope AppD BT must have a corresponding <code>span_name</code>. Record calls/min side by side in FPC §2.</p>
+<h3>Step 6 — Verify logs in Loki and correlation</h3>
+<pre><code class="language-logql">{service_name=&quot;app01-quote-api&quot;} |= &quot;trace_id&quot;
+</code></pre>
+<p>Pick a line, copy the <code>trace_id</code>, open it in Tempo. Then from a Tempo span click <em>Logs for this span</em> — both directions must work (data source <code>tracesToLogsV2</code> and Loki derived field configured, see <code>lab/grafana/provisioning/datasources/datasources.yml</code>).</p>
+<h3>Step 7 — Dashboards, alerts, routing as code</h3>
+<ol>
+<li>Add the app to <code>terraform/envs/&lt;env&gt;/main.tf</code> (<code>business_transactions</code> from FPC §3, <code>assignment_group</code> from FPC §4).</li>
+<li>PR → ADO pipeline → <code>plan</code> shows the objects → merge → <code>apply</code>.</li>
+<li>Grafana → folder <code>APP-01 (&lt;env&gt;)</code>: dashboard shows the same BT rows as Step 5; rule group lists one rule per static health rule.</li>
+<li>Enable <code>enable_routing_test = true</code>, wait for the incident, record number + group in FPC §4, set back to <code>false</code>.</li>
+</ol>
+<h3>Step 8 — Compare (non-prod) and record</h3>
+<p>Run for ≥ 3 business days (Java/Python dual-run; .NET side-by-side or canary). Export both sides; fill FPC §2 deltas. Pass: calls ±10 %, errors ±1 pt, p95 ±15 % or explained.</p>
+<h3>Step 9 — Prod cutover (CAB) and hypercare</h3>
+<p>Repeat Steps 2–6 in prod <strong>without</strong> the AppD agent. Verify within 15 minutes. Screenshot AppD Controller node list ("not reporting") → evidence. Start 10-business-day hypercare clock.</p>
+<h3>Step 10 — Evidence into the FPC</h3>
+<p>Trace screenshot, span-metrics table, routing incident number, redaction query result, Controller screenshot, rollback rehearsal date. Owner signs FPC §9.</p>
+<hr />
+<h2>8. Query cheat-sheet (one page)</h2>
+<table>
+<thead>
+<tr>
+<th>Need</th>
+<th>Where</th>
+<th>Query</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Any traces for a service</td>
+<td>Tempo</td>
+<td><code>{ resource.service.name = "app01-quote-api" }</code></td>
+</tr>
+<tr>
+<td>Error traces for a BT</td>
+<td>Tempo</td>
+<td><code>{ resource.service.name = "app01-quote-api" &amp;&amp; name = "BT:quote" &amp;&amp; status = error }</code></td>
+</tr>
+<tr>
+<td>Slow traces</td>
+<td>Tempo</td>
+<td><code>{ resource.service.name = "app01-quote-api" &amp;&amp; duration &gt; 2s }</code></td>
+</tr>
+<tr>
+<td>Traces for an APP_ID across services</td>
+<td>Tempo</td>
+<td><code>{ resource.service.namespace = "APP-01" }</code></td>
+</tr>
+<tr>
+<td>Which rule renamed the span</td>
+<td>Tempo</td>
+<td><code>{ span.bt.source = "header:x-channel" }</code></td>
+</tr>
+<tr>
+<td>Calls/min per BT</td>
+<td>Mimir</td>
+<td><code>sum by (span_name)(rate(traces_spanmetrics_calls_total{service="X"}[5m]))*60</code></td>
+</tr>
+<tr>
+<td>Error % per BT</td>
+<td>Mimir</td>
+<td><code>sum by (span_name)(rate(…{service="X",status_code="STATUS_CODE_ERROR"}[5m])) / sum by (span_name)(rate(…{service="X"}[5m]))*100</code></td>
+</tr>
+<tr>
+<td>p95 per BT</td>
+<td>Mimir</td>
+<td><code>histogram_quantile(0.95, sum by (le,span_name)(rate(traces_spanmetrics_latency_bucket{service="X"}[5m])))</code></td>
+</tr>
+<tr>
+<td>Dependencies</td>
+<td>Mimir</td>
+<td><code>sum by (client,server)(rate(traces_service_graph_request_total{client="X"}[5m]))</code></td>
+</tr>
+<tr>
+<td>JVM heap</td>
+<td>Mimir</td>
+<td><code>jvm_memory_used_bytes{service_name="X", jvm_memory_type="heap"}</code></td>
+</tr>
+<tr>
+<td>Logs with trace ids</td>
+<td>Loki</td>
+<td><code>{service_name="X"} \|= "trace_id"</code></td>
+</tr>
+<tr>
+<td>Logs for one trace</td>
+<td>Loki</td>
+<td><code>{service_name="X"} \| trace_id="&lt;id&gt;"</code></td>
+</tr>
+<tr>
+<td>Redaction evidence</td>
+<td>Loki</td>
+<td><code>{service_name="X"} \|= "[SSN]"</code></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>9. Troubleshooting matrix</h2>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Most likely</th>
+<th>Check / fix</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>No traces at all</td>
+<td>Agent not loaded, or cannot reach 4317</td>
+<td>Process start log; <code>OTEL_EXPORTER_OTLP_ENDPOINT</code>; VM: <code>ss -ltnp \| grep 4317</code>; EKS: <code>HOST_IP</code> env present, DaemonSet <code>hostPort</code> set</td>
+</tr>
+<tr>
+<td>Traces in non-prod but not prod</td>
+<td>Firewall VM → NLB, or wrong stack credentials</td>
+<td>Pipeline pod logs (401/403 = creds); host Alloy exporter retries = network</td>
+</tr>
+<tr>
+<td>Traces present, <strong>no <code>traces_spanmetrics_*</code></strong></td>
+<td>Metrics-generator disabled on that stack</td>
+<td>Step 0.1 — portal; or enable in-pipeline connector (§6)</td>
+</tr>
+<tr>
+<td>Span names are raw URLs (<code>/api/quote/123</code>)</td>
+<td>BT rule didn't match: wrong <code>app.id</code>, old semconv attribute names, or wrong <code>kind</code></td>
+<td>Check <code>resource.app.id</code>, <code>url.path</code> present, <code>kind=SERVER</code>; add to normalisation block</td>
+</tr>
+<tr>
+<td>Hundreds of span names for one service</td>
+<td>Cardinality — IDs/UUIDs in names</td>
+<td>Global guard regexes; add app-specific <code>replace_pattern</code>; Mimir series limit alerts</td>
+</tr>
+<tr>
+<td><code>status_code</code> always <code>UNSET</code> for 4xx</td>
+<td>By OTel spec, server 4xx is <strong>not</strong> an error (unlike AppD)</td>
+<td>Decide per app: alert on <code>http.response.status_code&gt;=500</code> only, or add OTTL <code>set(status.code, STATUS_CODE_ERROR) where attributes["http.response.status_code"] &gt;= 400</code> for parity</td>
+</tr>
+<tr>
+<td>Logs arrive but no <code>trace_id</code></td>
+<td>Log bridge/MDC not enabled, or log written outside a span</td>
+<td>Java: logback appender env; Python: <code>OTEL_PYTHON_LOG_CORRELATION=true</code>; .NET: ILogger bridge default on</td>
+</tr>
+<tr>
+<td>Trace → Logs button empty</td>
+<td>Data source link not configured, or time shift too narrow</td>
+<td><code>tracesToLogsV2</code> with <code>filterByTraceID</code>, <code>spanStartTimeShift: -5m</code></td>
+</tr>
+<tr>
+<td>Alert rule "No data"</td>
+<td>Label mismatch (<code>service</code> vs <code>service_name</code>), or wrong datasource UID</td>
+<td>Run the rule query in Explore on the same datasource</td>
+</tr>
+<tr>
+<td>Alert fires, no ServiceNow incident</td>
+<td>Policy matcher labels don't match rule labels; contact point auth</td>
+<td>Alerting → Notification policies → <em>Preview routing</em>; Contact point → <em>Test</em></td>
+</tr>
+<tr>
+<td>.NET: nothing instrumented</td>
+<td>AppD profiler still registered, or Framework &lt; 4.6.2</td>
+<td><code>Get-ChildItem Env:COR_PROFILER*</code>; uninstall AppD first; check runtime version</td>
+</tr>
+<tr>
+<td>Python: some frameworks missing spans</td>
+<td>Library not covered by <code>opentelemetry-bootstrap</code></td>
+<td><code>pip list \| grep opentelemetry-instrumentation-</code>; unsupported framework → Code/Exception</td>
+</tr>
+<tr>
+<td>EKS: all pods show <code>app.id=UNMAPPED</code></td>
+<td>Pod label → resource attribute mapping missing in DaemonSet</td>
+<td><code>otelcol.processor.k8sattributes</code> <code>extract { label { from="pod" key="app.pacificlife.com/app-id" tag_name="app.id" } }</code></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>10. File index for this guide</h2>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>alloy/host/config.alloy</code></td>
+<td>Host Alloy (VM): OTLP receiver, CMDB attrs, host metrics, logs → pipeline</td>
+</tr>
+<tr>
+<td><code>alloy/eks/config.alloy</code></td>
+<td>Regional pipeline: enrich + semconv normalisation, redact, tail sampling, export</td>
+</tr>
+<tr>
+<td><code>alloy/eks/bt-rules.alloy</code></td>
+<td>Per-app BT split rules (OTTL)</td>
+</tr>
+<tr>
+<td><code>alloy/eks/values.yaml</code></td>
+<td>Helm values — pipeline on EKS</td>
+</tr>
+<tr>
+<td><code>lab/tempo/tempo.yaml</code></td>
+<td>Self-hosted Tempo with metrics-generator (annotated in §3.2)</td>
+</tr>
+<tr>
+<td><code>lab/alloy/config.alloy</code></td>
+<td>Pipeline variant exporting to local Tempo/Prometheus/Loki</td>
+</tr>
+<tr>
+<td><code>lab/grafana/provisioning/datasources/datasources.yml</code></td>
+<td>Trace↔logs↔metrics correlation settings to mirror in Grafana Cloud</td>
+</tr>
+<tr>
+<td><code>terraform/modules/span-metrics-alerts</code></td>
+<td>Health rules on span-metrics (PromQL from §4.2)</td>
+</tr>
+<tr>
+<td><code>terraform/modules/golden-signal-dashboard</code></td>
+<td>Dashboard using the same PromQL/TraceQL/LogQL</td>
+</tr>
+<tr>
+<td><code>agents/java.md</code>, <code>agents/dotnet.md</code>, <code>agents/python.md</code></td>
+<td>Full agent option lists per runtime</td>
+</tr>
+</tbody>
+</table></body></html>

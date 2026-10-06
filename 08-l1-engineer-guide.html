@@ -1,0 +1,843 @@
+<!doctype html><html><head><meta charset='utf-8'><style>
+@page { size: A4; margin: 16mm 14mm; }
+body { font-family: Helvetica, Arial, sans-serif; font-size: 10.5pt; color: #111; line-height: 1.38; }
+h1 { font-size: 22pt; color: #0B3D91; border-bottom: 3px solid #F46800; padding-bottom: 4px; }
+h2 { font-size: 15pt; color: #0B3D91; margin-top: 26px; page-break-after: avoid; }
+h3 { font-size: 12pt; color: #333; margin-top: 18px; page-break-after: avoid; }
+table { border-collapse: collapse; width: 100%; margin: 8px 0 14px; font-size: 9pt; page-break-inside: auto; }
+th, td { border: 1px solid #C9CDD3; padding: 4px 6px; vertical-align: top; text-align: left; }
+th { background: #EEF2F7; }
+tr { page-break-inside: avoid; }
+code { font-family: Menlo, Consolas, monospace; font-size: 8.6pt; background: #F3F4F6; padding: 1px 3px; border-radius: 3px; }
+pre { background: #0F172A; color: #E2E8F0; padding: 10px 12px; border-radius: 6px; font-size: 7.6pt; line-height: 1.25; overflow: hidden; white-space: pre; page-break-inside: avoid; }
+pre code { background: none; color: inherit; font-size: inherit; padding: 0; }
+blockquote { border-left: 4px solid #F46800; margin: 10px 0; padding: 6px 12px; background: #FFF7ED; color: #333; }
+img.diagram { display: block; max-width: 100%; max-height: 240mm; margin: 10px auto 6px; page-break-inside: avoid; }
+figcaption { text-align: center; font-size: 8.5pt; color: #666; margin-bottom: 14px; }
+hr { border: 0; border-top: 1px solid #DDD; margin: 20px 0; }
+.cover { text-align: center; margin-top: 140px; page-break-after: always; }
+.cover h1 { border: 0; font-size: 30pt; }
+.cover p { color: #555; font-size: 12pt; }
+</style></head><body><div class="cover"><h1>L1 Engineer's Guide</h1><p>Pacific Life — AppDynamics → OpenTelemetry / Grafana Cloud</p><p>Trace3 Delivery · every tool, where it runs, how it connects, where we are, what done looks like</p></div><h1>L1 Engineer's Guide — Pacific Life AppDynamics → OpenTelemetry/Grafana</h1>
+<blockquote>
+<p>Read this first if you are new to the project. It explains every tool, where it runs, who owns it, how the pieces connect, where we are today, and what "done" looks like. Diagrams are plain text so they survive DOCX/email.</p>
+</blockquote>
+<hr />
+<h2>1. The one-paragraph version</h2>
+<p>Pacific Life pays for <strong>AppDynamics (AppD)</strong> to monitor 10 applications. The contract ends <strong>31 Dec 2026</strong> and they do not want to renew. Our job (Trace3) is to replace the AppD agent inside each app with an <strong>OpenTelemetry (OTel)</strong> agent, send that data through <strong>Grafana Alloy</strong> (a collector Pacific Life already runs) into <strong>Grafana Cloud</strong> (which Pacific Life already owns), rebuild the same alerts/dashboards there as code, prove the app teams can see the same things they saw before ("functional parity"), make sure alerts still create <strong>ServiceNow</strong> tickets in the right team's queue, and hand Pacific Life an evidence pack so they can safely let AppD expire.</p>
+<hr />
+<h2>2. Glossary — every tool and term, in plain words</h2>
+<h3>Monitoring concepts</h3>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Plain meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>APM</strong> (Application Performance Monitoring)</td>
+<td>Watching what happens <em>inside</em> an application: which requests came in, how long they took, which failed, which database/API calls they made.</td>
+</tr>
+<tr>
+<td><strong>Trace</strong></td>
+<td>The full story of one request as it travels through the app (and other services). Made of <strong>spans</strong>.</td>
+</tr>
+<tr>
+<td><strong>Span</strong></td>
+<td>One step inside a trace, e.g. "HTTP GET /api/quote took 120 ms" or "SQL SELECT took 15 ms". Has a name, start/end time, status (OK/ERROR), and attributes (key=value, like <code>http.route=/api/quote</code>).</td>
+</tr>
+<tr>
+<td><strong>Metrics</strong></td>
+<td>Numbers over time: requests per second, error %, CPU. Cheap to store, good for alerting.</td>
+</tr>
+<tr>
+<td><strong>Logs</strong></td>
+<td>Text lines the app writes. Useful when correlated to a trace via <code>trace_id</code>.</td>
+</tr>
+<tr>
+<td><strong>RED</strong></td>
+<td><strong>R</strong>ate (calls/min), <strong>E</strong>rrors (%), <strong>D</strong>uration (latency, e.g. p95). The three golden numbers per service/endpoint.</td>
+</tr>
+<tr>
+<td><strong>p95</strong></td>
+<td>95% of requests were faster than this value. Better than "average" because it shows the slow tail.</td>
+</tr>
+<tr>
+<td><strong>Instrumentation</strong></td>
+<td>The code that produces traces/metrics/logs. <strong>Zero-code / auto-instrumentation</strong> = an agent injected at startup does it for you; no app code changes.</td>
+</tr>
+<tr>
+<td><strong>Dual-run</strong></td>
+<td>Two monitoring agents in the same process at the same time (old + new) so you can compare. Possible for Java and Python; <strong>impossible for .NET</strong>.</td>
+</tr>
+<tr>
+<td><strong>Cardinality</strong></td>
+<td>Number of unique label combinations in a metric. Too many (e.g. a user ID in a span name) = huge cost. We guard against it.</td>
+</tr>
+<tr>
+<td><strong>Tail sampling</strong></td>
+<td>Deciding <em>after</em> a trace completes whether to keep it (keep all errors, all slow ones, 10% of normal). Saves cost.</td>
+</tr>
+<tr>
+<td><strong>PII</strong></td>
+<td>Personal data (SSN, card numbers, emails). Must be scrubbed before it leaves Pacific Life's network.</td>
+</tr>
+</tbody>
+</table>
+<h3>AppDynamics terms (the thing we are replacing)</h3>
+<table>
+<thead>
+<tr>
+<th>AppD term</th>
+<th>Meaning</th>
+<th>OTel/Grafana equivalent</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Controller</strong></td>
+<td>The AppD server/UI where everything is stored and viewed. Stays up until Dec 31 as fallback.</td>
+<td>Grafana Cloud</td>
+</tr>
+<tr>
+<td><strong>Agent</strong></td>
+<td>Library attached to the app (Java <code>-javaagent</code>, .NET CLR profiler, Python <code>pyagent</code>) that sends data to the Controller. <strong>This is what we remove.</strong></td>
+<td>OTel zero-code agent</td>
+</tr>
+<tr>
+<td><strong>Business Transaction (BT)</strong></td>
+<td>A named entry point into the app, e.g. "Get Quote", "Bind Policy". AppD auto-detects them and lets you add custom split rules (by URL segment, HTTP header, or Java class/method = "POJO").</td>
+<td>A <strong>span-metrics series</strong> keyed on <code>service.name</code> + <code>span_name</code> (<code>http.route</code>). Custom split rules are rewritten as <strong>OTTL</strong> rules in the pipeline.</td>
+</tr>
+<tr>
+<td><strong>Health Rule</strong></td>
+<td>A condition on a BT or tier: "error rate &gt; 2% for 5 min". Can be <strong>static</strong> (fixed number) or <strong>dynamic baseline</strong> (AppD learns "normal").</td>
+<td><strong>Grafana alert rule</strong> on span-metrics. Baseline rules need a decision: static threshold or Grafana ML.</td>
+</tr>
+<tr>
+<td><strong>Policy / Action</strong></td>
+<td>"When health rule X fires → create ServiceNow incident in group Y".</td>
+<td>Grafana <strong>notification policy + contact point</strong> (webhook to ServiceNow).</td>
+</tr>
+<tr>
+<td><strong>Snapshot</strong></td>
+<td>A captured slow/error request with full detail.</td>
+<td>A <strong>trace in Tempo</strong>, kept by tail sampling.</td>
+</tr>
+<tr>
+<td><strong>Dashboard</strong></td>
+<td>Visual panels.</td>
+<td>Grafana dashboard (built from a Terraform template).</td>
+</tr>
+<tr>
+<td><strong>Information Point / Data Collector</strong></td>
+<td>Custom business values captured from code (e.g. "policy amount").</td>
+<td>Span attribute → may need app code change (Pacific Life owns) or becomes an exception.</td>
+</tr>
+<tr>
+<td><strong>EUM / DB Visibility / Analytics / Synthetics</strong></td>
+<td>Browser monitoring, DB-server monitoring, business analytics, synthetic checks.</td>
+<td>No zero-code equivalent — Pacific Life must decide in-scope or exception (Discovery Q2).</td>
+</tr>
+</tbody>
+</table>
+<h3>OpenTelemetry (OTel) terms (the new standard)</h3>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>OpenTelemetry</strong></td>
+<td>Open-source, vendor-neutral standard for producing telemetry. Owned by CNCF, not a vendor. Every APM vendor now accepts it.</td>
+</tr>
+<tr>
+<td><strong>OTLP</strong></td>
+<td>OpenTelemetry Protocol — the wire format. gRPC on port <strong>4317</strong>, HTTP on port <strong>4318</strong>.</td>
+</tr>
+<tr>
+<td><strong>OTel Java agent</strong></td>
+<td>A <code>.jar</code> added with <code>-javaagent:</code> at JVM start. Auto-instruments Spring, Tomcat, JDBC, JMS, etc.</td>
+</tr>
+<tr>
+<td><strong>OTel .NET auto-instrumentation</strong></td>
+<td>A CLR profiler registered via <code>COR_PROFILER</code> env vars. Auto-instruments ASP.NET, HttpClient, SQL. <strong>Only one profiler per process</strong> — this is why AppD and OTel cannot coexist on .NET.</td>
+</tr>
+<tr>
+<td><strong>OTel Python distro</strong></td>
+<td><code>opentelemetry-instrument your_app</code> wrapper that monkey-patches Django/Flask/FastAPI, requests, DB drivers. Weakest coverage of the three.</td>
+</tr>
+<tr>
+<td><strong>Resource attributes</strong></td>
+<td>Metadata about <em>who</em> is sending: <code>service.name</code>, <code>app.id</code>, <code>deployment.environment</code>. Set via <code>OTEL_RESOURCE_ATTRIBUTES</code>.</td>
+</tr>
+<tr>
+<td><strong>OTel Collector</strong></td>
+<td>A standalone process that receives, processes, and exports telemetry. Grafana Alloy <em>is</em> an OTel Collector distribution (plus more).</td>
+</tr>
+<tr>
+<td><strong>OTTL</strong></td>
+<td>OpenTelemetry Transformation Language — small statements run inside the collector to rename spans, set/delete attributes, redact. We use it to reproduce AppD BT rules and PII redaction. Example: <code>set(name, "BT:quote") where IsMatch(attributes["url.path"], "^/api/quote")</code>.</td>
+</tr>
+</tbody>
+</table>
+<h3>Grafana stack terms</h3>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+<th>Where it runs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Grafana Alloy</strong></td>
+<td>Grafana's collector. Reads OTLP, Prometheus, logs; processes; forwards. Config files end in <code>.alloy</code>.</td>
+<td>Two places: <strong>on every app host</strong> (already deployed by Pacific Life) and as a <strong>regional pipeline on EKS</strong>.</td>
+</tr>
+<tr>
+<td><strong>Amazon EKS</strong></td>
+<td>AWS-managed Kubernetes. Hosts the regional Alloy pipeline (3 replicas, behind an internal NLB).</td>
+<td>AWS, Pacific Life account</td>
+</tr>
+<tr>
+<td><strong>Grafana Cloud</strong></td>
+<td>Grafana's SaaS. Pacific Life owns the account and pays for ingest. Contains the four services below.</td>
+<td>SaaS (Grafana-hosted)</td>
+</tr>
+<tr>
+<td><strong>Tempo</strong></td>
+<td>Trace storage/query. Has a <strong>metrics-generator</strong> that turns spans into RED metrics automatically.</td>
+<td>Inside Grafana Cloud</td>
+</tr>
+<tr>
+<td><strong>Mimir</strong></td>
+<td>Prometheus-compatible metrics storage. Receives host metrics <em>and</em> the span-metrics Tempo generates. Alert rules query Mimir.</td>
+<td>Inside Grafana Cloud</td>
+</tr>
+<tr>
+<td><strong>Loki</strong></td>
+<td>Log storage/query.</td>
+<td>Inside Grafana Cloud</td>
+</tr>
+<tr>
+<td><strong>Span-metrics</strong></td>
+<td>Metrics Tempo generates from traces: <code>traces_spanmetrics_calls_total</code> (rate+errors) and <code>traces_spanmetrics_latency_bucket</code> (duration), labelled by <code>service</code>, <code>span_name</code>, <code>status_code</code>. <strong>These are our BT equivalents.</strong></td>
+<td>Mimir</td>
+</tr>
+<tr>
+<td><strong>Application Observability</strong></td>
+<td>Grafana Cloud UI that shows a service map and RED per service/operation from span-metrics. Nice-to-have; Q9 confirms it's on.</td>
+<td>Grafana Cloud</td>
+</tr>
+<tr>
+<td><strong>Grafana Alerting</strong></td>
+<td>Alert rules (query + threshold), contact points (where to send), notification policies (routing by labels).</td>
+<td>Grafana Cloud</td>
+</tr>
+<tr>
+<td><strong>TraceQL / PromQL / LogQL</strong></td>
+<td>Query languages for Tempo / Mimir / Loki.</td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h3>Delivery tooling</h3>
+<table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Terraform</strong></td>
+<td>Infrastructure-as-code. We describe dashboards, alert rules, contact points in <code>.tf</code> files; Terraform creates them in Grafana via the <strong>Grafana provider</strong>. Repeatable for all 10 apps and the 343 after.</td>
+</tr>
+<tr>
+<td><strong>Azure DevOps (ADO)</strong></td>
+<td>Pacific Life's Git + CI/CD. Our Terraform and Alloy configs live here; pipelines run <code>plan</code>/<code>apply</code>. State in Azure Storage.</td>
+</tr>
+<tr>
+<td><strong>Helm</strong></td>
+<td>Kubernetes package manager. Deploys the Alloy pipeline to EKS with <code>values.yaml</code>.</td>
+</tr>
+<tr>
+<td><strong>ServiceNow (SNOW)</strong></td>
+<td>Pacific Life's ITSM. Alerts become <strong>incidents</strong> assigned to an <strong>assignment group</strong> (a team queue). Also holds the <strong>CMDB</strong>.</td>
+</tr>
+<tr>
+<td><strong>CMDB</strong></td>
+<td>Configuration Management Database. Source of truth for <code>APP_ID</code> and environment per host/app.</td>
+</tr>
+<tr>
+<td><strong>CAB</strong></td>
+<td>Change Advisory Board. Approves production changes. Has a lead time we must plan around.</td>
+</tr>
+<tr>
+<td><strong>Hypercare</strong></td>
+<td>Fixed window (10 business days) after prod cutover when we watch closely and can roll back fast.</td>
+</tr>
+<tr>
+<td><strong>Change freeze</strong></td>
+<td>Dec 21 – Jan 3: no production changes. So Dec 18 is our real last change date.</td>
+</tr>
+<tr>
+<td><strong>FPC</strong></td>
+<td>Functional Parity Checklist — our per-app acceptance document. If it isn't ticked and signed, the app isn't done.</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>3. Where we are today (current state)</h2>
+<figure><img class="diagram" src="img/01-current-state.png"><figcaption>01 current state</figcaption></figure>
+
+<pre><code> PACIFIC LIFE TODAY
+ ═══════════════════════════════════════════════════════════════════════════
+
+   ON-PREM DATA CENTER                 AWS                                 SaaS
+   ┌────────────────────────┐   ┌────────────────────────┐   ┌─────────────────────────┐
+   │ App hosts (VMs)        │   │ App hosts (EC2 / EKS)  │   │ AppDynamics Controller  │
+   │ ┌────────────────────┐ │   │ ┌────────────────────┐ │   │  BTs, health rules,     │
+   │ │ App (Java/.NET/Py) │ │   │ │ App                │ │   │  policies, dashboards   │
+   │ │  + AppD agent ─────┼─┼───┼─┼─ + AppD agent ─────┼─┼──▶│  snapshots              │
+   │ └────────────────────┘ │   │ └────────────────────┘ │   │      │ policy action     │
+   │ ┌────────────────────┐ │   │ ┌────────────────────┐ │   └──────┼──────────────────┘
+   │ │ Grafana Alloy      │ │   │ │ Grafana Alloy      │ │          ▼
+   │ │ (host metrics,     │ │   │ │ (host metrics,     │ │   ┌─────────────────────────┐
+   │ │  logs only)        │ │   │ │  logs only)        │ │   │ ServiceNow              │
+   │ └─────────┬──────────┘ │   │ └─────────┬──────────┘ │   │  Incidents → app team   │
+   └───────────┼────────────┘   └───────────┼────────────┘   │  CMDB (APP_ID, env)     │
+               │                            │                └─────────────────────────┘
+               └──────────────┬─────────────┘
+                              ▼
+                   ┌────────────────────────┐
+                   │ Grafana Cloud (PL-owned)│   Already receiving host metrics + logs.
+                   │  Mimir  Loki  Tempo(idle)│  Tempo probably has little/no app traces yet.
+                   └────────────────────────┘
+</code></pre>
+<p><strong>What exists already (we reuse):</strong> Alloy on every host; Grafana Cloud account; Azure DevOps; ServiceNow + CMDB with <code>APP_ID</code> tagging; an Alloy pipeline on EKS (owned by Pacific Life platform team).</p>
+<p><strong>What does <em>not</em> exist yet:</strong> OTel agents in the apps; BT/PII rules in the pipeline; span-metrics; alert rules/dashboards in Grafana for these apps; the Grafana → ServiceNow routing per app; any parity evidence.</p>
+<p><strong>Project status: Phase 0.</strong> Discovery Request is drafted (21 questions), templates and reference configs are written, nothing has been changed on any Pacific Life system yet.</p>
+<hr />
+<h2>4. End goal (target state) — with hosting</h2>
+<figure><img class="diagram" src="img/02-target-state.png"><figcaption>02 target state</figcaption></figure>
+
+<pre><code> TARGET STATE — 31 DEC 2026
+ ═══════════════════════════════════════════════════════════════════════════════════════
+
+  WHERE: app hosts (on-prem VMs + AWS EC2/EKS)          OWNER: app teams / PL platform
+ ┌─────────────────────────────────────────────────────────────────────────────────────┐
+ │  ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐          │
+ │  │ Java app            │  │ .NET app            │  │ Python app          │          │
+ │  │ -javaagent:otel.jar │  │ COR_PROFILER=OTel   │  │ opentelemetry-      │          │
+ │  │ (AppD agent GONE)   │  │ (AppD agent GONE)   │  │ instrument (AppD    │          │
+ │  └──────────┬──────────┘  └──────────┬──────────┘  │ GONE)               │          │
+ │             │ OTLP gRPC :4317        │              └──────────┬──────────┘          │
+ │             └────────────────────────┴─────────────────────────┘                     │
+ │                                      ▼                                               │
+ │  ┌─────────────────────────────────────────────────────────────────────────────┐    │
+ │  │ HOST ALLOY  (alloy/host/config.alloy)                                        │    │
+ │  │  otlp receiver 127.0.0.1:4317/4318  →  add app.id + env from CMDB vars       │    │
+ │  │  + host metrics (node exporter)  + log files → OTLP logs                     │    │
+ │  └─────────────────────────────────────┬───────────────────────────────────────┘    │
+ └────────────────────────────────────────┼────────────────────────────────────────────┘
+                                          │ OTLP gRPC over TLS → internal NLB
+                                          ▼
+  WHERE: Amazon EKS (PL AWS account)                      OWNER: PL platform eng (we PR changes)
+ ┌─────────────────────────────────────────────────────────────────────────────────────┐
+ │ REGIONAL ALLOY PIPELINE  (alloy/eks/config.alloy + bt-rules.alloy, 3 replicas)      │
+ │                                                                                     │
+ │  [otlp receiver :4317] → [memory limiter] → [ENRICH: app.id, environment,           │
+ │   service.namespace] → [BT RULES (OTTL): rename spans to AppD BT names] →           │
+ │  [REDACT (OTTL): strip query strings, SSN/PAN/email, auth headers] →                │
+ │  [TAIL SAMPLING: keep errors + &gt;2s + 5xx + 10% baseline; non-prod keep all] →       │
+ │  [batch] → [otlphttp exporter, basic auth]                                          │
+ └─────────────────────────────────────┬───────────────────────────────────────────────┘
+                                       │ HTTPS → Grafana Cloud OTLP gateway
+                                       ▼
+  WHERE: Grafana Cloud SaaS                               OWNER &amp; PAYER: Pacific Life
+ ┌─────────────────────────────────────────────────────────────────────────────────────┐
+ │  TEMPO (traces) ──metrics-generator──▶ MIMIR (metrics)        LOKI (logs)           │
+ │     │                                    │  traces_spanmetrics_calls_total            │
+ │     │                                    │  traces_spanmetrics_latency_bucket          │
+ │     │                                    │  (= AppD BTs)                               │
+ │     ▼                                    ▼                                             │
+ │  Application Observability   ◀──  GRAFANA ALERTING  ──▶  DASHBOARDS                   │
+ │  (service map, RED)               (health-rule equivalents) (golden signals / BT)      │
+ │                                        │                      ▲                        │
+ │                                        │ webhook              │ created by Terraform   │
+ └────────────────────────────────────────┼──────────────────────┼────────────────────────┘
+                                          ▼                      │
+  WHERE: ServiceNow SaaS (PL)             │          WHERE: Azure DevOps (PL)
+ ┌──────────────────────────────┐         │         ┌────────────────────────────────────┐
+ │ Incident → assignment group  │◀────────┘         │ Repos: terraform/, alloy/            │
+ │ (same group AppD used)       │                   │ Pipeline: fmt → validate → plan →    │
+ │ CMDB: APP_ID, environment ───┼───(feeds enrich)──│ apply (prod gated by CAB approval)   │
+ └──────────────────────────────┘                   └────────────────────────────────────┘
+
+  AppD Controller: still licensed and reachable until Dec 31 as FALLBACK ONLY. Zero agents reporting.
+</code></pre>
+<p><strong>"Done" means, for each of the 10 apps:</strong> OTel agent on, AppD agent off; BTs visible as span-metrics within ±10% of AppD; every health rule has a Grafana alert; a test alert created a ServiceNow incident in the same group; dashboards exist; exceptions approved in writing; rollback rehearsed; owner signed the FPC. Then all 10 roll up into the <strong>Decommission-Readiness Pack</strong> (draft Nov 27, final Dec 18).</p>
+<hr />
+<h2>5. Follow one request end-to-end</h2>
+<figure><img class="diagram" src="img/03-request-flow.png"><figcaption>03 request flow</figcaption></figure>
+
+<p>Take <code>GET /api/quote/123</code> on APP-01 (Java) in prod after cutover.</p>
+<pre><code> 1. Tomcat receives the request.
+    OTel Java agent (loaded via -javaagent) creates a SERVER span:
+      name = &quot;GET /api/quote/{id}&quot;   http.route=&quot;/api/quote/{id}&quot;   url.path=&quot;/api/quote/123&quot;
+      resource: service.name=&quot;app01-quote-api&quot;  app.id=&quot;APP-01&quot;  deployment.environment=&quot;prod&quot;
+    Child spans: JDBC SELECT (CLIENT span), outbound HTTP to rating service (CLIENT span).
+    Logback appender sends log lines with trace_id as OTLP logs.
+
+ 2. Agent exports the finished trace over OTLP gRPC to 127.0.0.1:4317  → HOST ALLOY.
+
+ 3. HOST ALLOY: adds host.name; inserts app.id/deployment.environment if agent didn't; batches;
+    sends to the regional pipeline NLB (TLS).
+
+ 4. EKS PIPELINE:
+    enrich  → service.namespace=&quot;APP-01&quot; (so Grafana groups services per app)
+    bt_rules→ APP-01 rule: url.path matches ^/api/(?P&lt;bt&gt;[^/]+) → bt.name=&quot;quote&quot;
+              → span name becomes &quot;BT:quote&quot;; if header x-channel=mobile → &quot;BT:quote@mobile&quot;
+              (this is exactly the AppD BT &quot;Quote (mobile)&quot;)
+    redact  → url.full loses &quot;?...&quot; ; any SSN-looking string → &quot;[SSN]&quot; ; SQL literals → &quot;?&quot;
+    sampling→ waits 15s for the whole trace; keeps it if ERROR / &gt;2s / 5xx / lucky 10%
+    batch   → otlphttp → https://otlp-gateway-...grafana.net/otlp  (basic auth: instance id + token)
+
+ 5. GRAFANA CLOUD:
+    Tempo stores the trace (if sampled).
+    Tempo metrics-generator increments:
+      traces_spanmetrics_calls_total{service=&quot;app01-quote-api&quot;, span_name=&quot;BT:quote&quot;, status_code=&quot;STATUS_CODE_OK&quot;}
+      traces_spanmetrics_latency_bucket{... le=&quot;0.25&quot;}
+    → written into Mimir. Loki stores the log lines with trace_id.
+
+ 6. ALERTING (every 60s):
+    rule &quot;APP-01 | BT:quote | error rate &gt; 2%&quot; runs PromQL against Mimir.
+    If true for 5 min → alert fires with labels app_id=APP-01, severity=critical.
+    Notification policy matches app_id=APP-01 → contact point &quot;snow-app-01-prod&quot; (webhook)
+    → ServiceNow creates incident, assignment_group=&quot;PL-Quote-Platform-L2&quot;.
+
+ 7. HUMAN: opens the APP-01 Golden Signals dashboard → sees BT:quote error % spike →
+    clicks into Tempo &quot;recent error traces&quot; → opens the trace → sees the JDBC span failing →
+    clicks the trace_id → Loki shows the stack trace log line.
+</code></pre>
+<p>That chain — <strong>agent → host Alloy → EKS pipeline → Tempo/Mimir/Loki → alert → ServiceNow</strong> — is the whole project. Every deliverable configures one link of it.</p>
+<hr />
+<h2>6. Hosting &amp; ownership map</h2>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Hosted where</th>
+<th>Owned by</th>
+<th>Paid by</th>
+<th>Who changes it</th>
+<th>Our repo artifact</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Applications (10)</td>
+<td>On-prem VMs, AWS EC2, some EKS</td>
+<td>PL app teams</td>
+<td>PL</td>
+<td>App teams (via their CI/CD) — we provide the exact flags</td>
+<td><code>agents/java.md</code>, <code>dotnet.md</code>, <code>python.md</code></td>
+</tr>
+<tr>
+<td>OTel agents</td>
+<td>Inside each app process</td>
+<td>OSS (CNCF)</td>
+<td>—</td>
+<td>App teams deploy; we specify version</td>
+<td>same</td>
+</tr>
+<tr>
+<td>Host Alloy</td>
+<td>Every app host</td>
+<td>PL platform eng</td>
+<td>PL</td>
+<td>PL (already deployed); we may request receiver enablement</td>
+<td><code>alloy/host/config.alloy</code> (reference)</td>
+</tr>
+<tr>
+<td>Regional Alloy pipeline</td>
+<td>Amazon EKS, PL AWS account, 3 pods behind internal NLB</td>
+<td>PL platform eng</td>
+<td>PL (AWS)</td>
+<td><strong>We PR changes</strong>; PL merges; CAB for prod</td>
+<td><code>alloy/eks/config.alloy</code>, <code>bt-rules.alloy</code>, <code>values.yaml</code></td>
+</tr>
+<tr>
+<td>Grafana Cloud (Tempo/Mimir/Loki/Alerting/Dashboards)</td>
+<td>Grafana SaaS</td>
+<td>PL</td>
+<td>PL (ingest licence)</td>
+<td><strong>We</strong> via Terraform</td>
+<td><code>terraform/**</code></td>
+</tr>
+<tr>
+<td>Terraform + pipelines</td>
+<td>Azure DevOps (PL tenant), state in Azure Storage</td>
+<td>PL DevOps</td>
+<td>PL</td>
+<td>We author; PL approves prod</td>
+<td><code>azure-pipelines.yml</code></td>
+</tr>
+<tr>
+<td>ServiceNow + CMDB</td>
+<td>SaaS (PL)</td>
+<td>PL SNOW team</td>
+<td>PL</td>
+<td>PL creates webhook user/groups; we configure Grafana side</td>
+<td><code>terraform/modules/servicenow-routing</code></td>
+</tr>
+<tr>
+<td>AppDynamics Controller</td>
+<td>SaaS or on-prem (PL)</td>
+<td>PL</td>
+<td>PL until Dec 31</td>
+<td>Nobody — read-only fallback, export source</td>
+<td>evidence folder</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>7. Integration points (what talks to what)</h2>
+<table>
+<thead>
+<tr>
+<th>From → To</th>
+<th>Protocol / port</th>
+<th>Auth</th>
+<th>Network path</th>
+<th>Failure symptom</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>App agent → Host Alloy</td>
+<td>OTLP gRPC <code>127.0.0.1:4317</code> (or HTTP 4318)</td>
+<td>none (localhost)</td>
+<td>loopback</td>
+<td>No spans in Tempo; agent log "connection refused"</td>
+</tr>
+<tr>
+<td>Host Alloy → EKS pipeline</td>
+<td>OTLP gRPC :4317 over TLS</td>
+<td>mTLS/TLS (PL standard)</td>
+<td>on-prem → AWS (firewall rule needed), EC2 → NLB</td>
+<td>Host Alloy log: exporter retries/queue full</td>
+</tr>
+<tr>
+<td>EKS pipeline → Grafana Cloud</td>
+<td>OTLP/HTTP over HTTPS (<code>otlp-gateway-&lt;region&gt;.grafana.net/otlp</code>)</td>
+<td>Basic auth: instance ID + API token (K8s secret)</td>
+<td>EKS egress → internet</td>
+<td>401/429 in pipeline logs; gaps in Mimir</td>
+</tr>
+<tr>
+<td>Tempo → Mimir</td>
+<td>internal (metrics-generator)</td>
+<td>—</td>
+<td>inside Grafana Cloud</td>
+<td><code>traces_spanmetrics_*</code> absent → metrics-generator not enabled (Q9)</td>
+</tr>
+<tr>
+<td>Grafana Alerting → ServiceNow</td>
+<td>HTTPS webhook POST</td>
+<td>Basic auth (integration user)</td>
+<td>Grafana Cloud → SNOW SaaS</td>
+<td>Contact point test fails; no incident</td>
+</tr>
+<tr>
+<td>Azure DevOps → Grafana Cloud</td>
+<td>HTTPS (Grafana API) via Terraform provider</td>
+<td>Service-account token (variable group)</td>
+<td>ADO agent → internet</td>
+<td><code>terraform apply</code> 401/403</td>
+</tr>
+<tr>
+<td>Azure DevOps → EKS</td>
+<td><code>kubectl</code>/Helm via service connection</td>
+<td>AWS IAM</td>
+<td>ADO agent → EKS API</td>
+<td>Helm upgrade fails</td>
+</tr>
+<tr>
+<td>CMDB → pipeline</td>
+<td>Not live — values copied into <code>OTEL_RESOURCE_ATTRIBUTES</code> / host env at provisioning</td>
+<td>—</td>
+<td>—</td>
+<td><code>app.id="UNMAPPED"</code> in traces</td>
+</tr>
+<tr>
+<td>App → AppD Controller (today)</td>
+<td>AppD proprietary over HTTPS</td>
+<td>account key</td>
+<td>—</td>
+<td>Removed at cutover; Controller shows node "not reporting" = our proof</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>8. The three runtimes — and why .NET is different</h2>
+<figure><img class="diagram" src="img/04-runtimes.png"><figcaption>04 runtimes</figcaption></figure>
+
+<pre><code> JAVA  (dual-run OK in non-prod)            .NET  (NO dual-run)                 PYTHON (dual-run usually OK)
+ ┌────────────────────────────┐            ┌────────────────────────────┐       ┌────────────────────────────┐
+ │ JVM                        │            │ CLR                        │       │ Interpreter                │
+ │  -javaagent:appd.jar  ✔    │            │  COR_PROFILER = ONE GUID   │       │  pyagent (AppD) ✔          │
+ │  -javaagent:otel.jar  ✔    │            │   either AppD  ──or── OTel │       │  opentelemetry-instrument ✔│
+ │  both instrument bytecode  │            │   never both               │       │  both monkey-patch         │
+ └────────────────────────────┘            └────────────────────────────┘       └────────────────────────────┘
+ Validate: side-by-side in the SAME        Validate: OTel in non-prod vs AppD    Validate: like Java, but
+ process ≥3 business days, compare RED.    prod baseline, OR prod canary node.   verify import-order conflicts.
+ Rollback: redeploy with AppD flag.        Rollback: REDEPLOY/REINSTALL AppD.    Rollback: redeploy old command.
+</code></pre>
+<p>How each gets enabled (details in <code>agents/*.md</code>):</p>
+<table>
+<thead>
+<tr>
+<th>Runtime</th>
+<th>Enable OTel</th>
+<th>Remove AppD</th>
+<th>Gotchas</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Java</td>
+<td>Add <code>-javaagent:/opt/otel/opentelemetry-javaagent.jar</code> + <code>OTEL_*</code> env vars; restart</td>
+<td>Remove AppD <code>-javaagent</code> line</td>
+<td>Other agents (security/profilers) may conflict; WebLogic/WebSphere need admin-console changes</td>
+</tr>
+<tr>
+<td>.NET</td>
+<td>Install OTel auto-instrumentation PowerShell module; <code>Register-OpenTelemetryForIIS</code>; <code>iisreset</code></td>
+<td>Uninstall AppD .NET agent MSI first</td>
+<td>Framework &lt; 4.6.2 unsupported; ASP.NET classic often lacks <code>http.route</code> → pipeline derives BT from URL</td>
+</tr>
+<tr>
+<td>Python</td>
+<td><code>pip install opentelemetry-distro opentelemetry-exporter-otlp; opentelemetry-bootstrap -a install</code>; wrap with <code>opentelemetry-instrument</code></td>
+<td>Drop <code>pyagent</code> wrapper / package</td>
+<td>gunicorn <code>--preload</code> needs <code>post_fork</code> hook; unsupported frameworks → code change</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>9. Inside the EKS pipeline (what each stage does and why)</h2>
+<figure><img class="diagram" src="img/05-pipeline-stages.png"><figcaption>05 pipeline stages</figcaption></figure>
+
+<pre><code> config.alloy                                                    bt-rules.alloy
+ ──────────────────────────────────────────────────────────      ──────────────────────────────
+ otelcol.receiver.otlp &quot;ingress&quot;       listens 4317/4318          otelcol.processor.transform &quot;bt_rules&quot;
+        ▼                                                          per-app OTTL statements:
+ otelcol.processor.memory_limiter      protects the pod            APP-01: URI segment, header, exclude
+        ▼                                                          APP-02: POJO method, JMS queue
+ otelcol.processor.transform &quot;enrich&quot;  app.id / env / namespace    APP-06: Controller/Action from URL
+        ▼ (traces)                                                 APP-05: exclude /static
+ otelcol.processor.transform &quot;bt_rules&quot;  ◀───────────────────────  global: /123 → /{id}, UUID → /{uuid}
+        ▼
+ otelcol.processor.transform &quot;redact&quot;  PII + headers + SQL literals (traces AND logs)
+        ▼ (traces)
+ otelcol.processor.tail_sampling       errors / slow / 5xx / nonprod-all / 10%
+        ▼
+ otelcol.processor.batch &quot;export&quot;      ◀── metrics &amp; logs join here
+        ▼
+ otelcol.exporter.otlphttp &quot;grafana_cloud&quot;  basic auth from K8s secret
+</code></pre>
+<p>Why BT rules live here and not in app code: 10 apps × many BT rules = one place to maintain, no app redeploys, and the same pattern scales to 343 apps. Why redaction is here: it's the last Pacific Life-controlled hop before data leaves for SaaS.</p>
+<p>Trade-off to know: tail sampling drops traces, and Tempo's metrics-generator only counts what arrives. So span-metrics reflect the <em>sampled</em> set unless we generate span-metrics inside the pipeline before sampling (a connector we can enable — Pacific Life decides, Q11).</p>
+<hr />
+<h2>10. Observability-as-code (Terraform + Azure DevOps)</h2>
+<figure><img class="diagram" src="img/06-terraform-flow.png"><figcaption>06 terraform flow</figcaption></figure>
+
+<pre><code> Engineer edits terraform/envs/prod/main.tf  (adds APP-03 with its BTs + thresholds)
+        │ git push → PR
+        ▼
+ ┌─ Azure DevOps pipeline (azure-pipelines.yml) ───────────────────────────────────────┐
+ │ Validate: terraform fmt / validate; alloy fmt + load test                             │
+ │ Plan:     terraform plan → &quot;will create 6 alert rules, 1 dashboard, 1 contact point&quot;  │
+ │ Apply:    nonprod auto on merge; prod waits on ADO Environment approval (= CAB ref)   │
+ └───────────────────────────────────────────────────────────────────────────────────────┘
+        │ Grafana provider → Grafana Cloud API
+        ▼
+ Grafana Cloud: folder &quot;APP-03 (prod)&quot; containing
+   • rule group &quot;APP-03-health-rules&quot;      (module span-metrics-alerts)
+   • dashboard &quot;APP-03 — Golden Signals&quot;   (module golden-signal-dashboard)
+   • contact point &quot;snow-app-03-prod&quot;       (module servicenow-routing)
+   • child notification policy app_id=APP-03 → that contact point
+</code></pre>
+<p>The three modules:</p>
+<table>
+<thead>
+<tr>
+<th>Module</th>
+<th>AppD thing it replaces</th>
+<th>Inputs</th>
+<th>Output in Grafana</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>span-metrics-alerts</code></td>
+<td>Health rules</td>
+<td><code>business_transactions</code> map: BT name → thresholds (error %, p95 ms, min calls/min), severity, strategy (static / ml / exception)</td>
+<td>Alert rules on <code>traces_spanmetrics_*</code>; outputs the list of ML candidates and exceptions for the FPC</td>
+</tr>
+<tr>
+<td><code>golden-signal-dashboard</code></td>
+<td>Dashboards</td>
+<td>service name, BT list, datasource UIDs</td>
+<td>One dashboard: service RED, per-BT RED, BT summary table, error traces, correlated logs</td>
+</tr>
+<tr>
+<td><code>servicenow-routing</code></td>
+<td>Policy → Action</td>
+<td>assignment group, SNOW webhook creds</td>
+<td>Contact point (webhook) + policy matcher on <code>app_id</code>; optional always-firing "routing test" rule to prove the incident lands in the right group</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>11. Alert → ServiceNow path (the parity test that matters most)</h2>
+<figure><img class="diagram" src="img/07-alert-to-servicenow.png"><figcaption>07 alert to servicenow</figcaption></figure>
+
+<pre><code> Mimir metric crosses threshold for 5m
+   → Grafana alert rule fires   labels: app_id=APP-01 severity=critical bt=BT:quote environment=prod
+   → Notification policy tree:  root (platform team) ──child: app_id=APP-01 &amp; environment=prod──▶
+   → Contact point &quot;snow-app-01-prod&quot; (webhook, basic auth)
+   → ServiceNow inbound API creates Incident
+        short_description = &quot;[FIRING] APP-01 error rate &gt; 2%&quot;
+        assignment_group  = &quot;PL-Quote-Platform-L2&quot;     ◀── must equal what the AppD policy used
+   → App team sees it in the same queue as before.  ✔ parity
+</code></pre>
+<p>We test this <strong>per app</strong> with the routing-test rule, record the incident number and group in FPC §4, then disable the test rule.</p>
+<hr />
+<h2>12. Life of one app through the project</h2>
+<figure><img class="diagram" src="img/08-app-lifecycle.png"><figcaption>08 app lifecycle</figcaption></figure>
+
+<pre><code> Discovery        Classify         Non-prod          Compare        CAB      Prod cutover   Hypercare (10 BD)   Accept
+ ───────────▶ ───────────▶ ───────────────▶ ───────────▶ ─────▶ ───────────▶ ────────────────▶ ───────▶
+ AppD export,    each BT /        OTel agent on      ≥3 business     change   AppD agent off   daily RED check,     FPC §9
+ runtime, owner, health rule /    (+AppD still on    days: calls     record   OTel on, rolling  alerts, incidents;   signed by
+ SNOW group,     dashboard →      for Java/Py);      ±10%, errors    with     restart; verify   rollback ready       owner →
+ 7-day baseline  Auto/Pipeline/   Terraform applied; ±1pt, p95 ±15%  rollback spans in 15 min;                       feeds
+                 Code/Exception   routing test                       steps    Controller shows                       Readiness
+                                                                               node gone                              Pack
+</code></pre>
+<p>Tranche 1 = 2 lowest-risk Java apps (we learn, write the runbook from reality). Tranche 2 &amp; 3 = remaining 8, run as two parallel streams (Java/Python vs .NET) because the validation methods differ.</p>
+<hr />
+<h2>13. Phase map and where we stand</h2>
+<figure><img class="diagram" src="img/09-phases.png"><figcaption>09 phases</figcaption></figure>
+
+<table>
+<thead>
+<tr>
+<th>Phase</th>
+<th>What happens</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>0 — Day-zero gates</strong></td>
+<td>Discovery Request issued; access + AppD export as gates; FPC template approved; proposal vs requirements reconciled</td>
+<td><strong>← We are here.</strong> Documents and reference configs drafted; nothing changed in PL systems</td>
+</tr>
+<tr>
+<td>1 — Discovery per app</td>
+<td>Exports, runtime inventory, classification, pick Tranche 1 apps</td>
+<td>Next</td>
+</tr>
+<tr>
+<td>2 — Pattern build (2 apps)</td>
+<td>Non-prod dual-run, Terraform modules live, prod cutover, hypercare, runbook v1.0</td>
+<td>—</td>
+</tr>
+<tr>
+<td>3 — Tranches 2 &amp; 3 (8 apps)</td>
+<td>Parallel streams, weekly exceptions review, Nov 30 exceptions cut-off</td>
+<td>—</td>
+</tr>
+<tr>
+<td>4 — Evidence &amp; exit</td>
+<td>Readiness Pack draft Nov 27 / final Dec 18; KT to PL Grafana team</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>14. What you will actually do as L1 on this project</h2>
+<p><strong>Daily checks during validation/hypercare</strong></p>
+<pre><code># Are spans arriving?           Grafana → Explore → Tempo:   { resource.service.name = &quot;app01-quote-api&quot; }
+# Are BT metrics there?         Explore → Mimir (PromQL):
+  sum by (span_name) (rate(traces_spanmetrics_calls_total{service=&quot;app01-quote-api&quot;}[5m])) * 60
+# Error % per BT:
+  sum by (span_name) (rate(traces_spanmetrics_calls_total{service=&quot;app01-quote-api&quot;,status_code=&quot;STATUS_CODE_ERROR&quot;}[5m]))
+  / sum by (span_name) (rate(traces_spanmetrics_calls_total{service=&quot;app01-quote-api&quot;}[5m])) * 100
+# Logs correlated?              Explore → Loki:  {service_name=&quot;app01-quote-api&quot;} |= &quot;trace_id&quot;
+# Alerts firing?                Alerting → Alert rules → folder APP-01
+# Pipeline healthy?             kubectl -n observability logs deploy/alloy-pipeline | grep -i error
+</code></pre>
+<p><strong>Triage ladder when "no data"</strong>
+1. Agent: is the process started with the OTel flag / profiler env? Agent log shows export errors?
+2. Host Alloy: <code>curl localhost:12345/-/ready</code>; log shows exporter queue/retry errors → network to EKS.
+3. EKS pipeline: pod logs show 401 (bad Grafana token), 429 (rate limit — ingest budget), or OTTL errors.
+4. Grafana: trace present but no <code>traces_spanmetrics_*</code> → metrics-generator off (Q9). Span names wrong → BT rule in <code>bt-rules.alloy</code>.
+5. Alert fired but no incident → contact point test; policy matcher labels (<code>app_id</code>, <code>environment</code>) ; SNOW integration user.</p>
+<p><strong>Evidence you will collect</strong> (goes into <code>evidence/&lt;APP_ID&gt;/</code> and the FPC)
+- Screenshot of AppD BT list vs Grafana BT table (calls/min side by side).
+- Comparison export for the ≥3-day window.
+- ServiceNow incident number from the routing test.
+- AppD Controller node list showing "not reporting" after cutover.
+- Rollback rehearsal date/duration.</p>
+<hr />
+<h2>15. Repo map (what's in <code>/deliverables</code>)</h2>
+<pre><code>deliverables/
+├── docs/
+│   ├── 00-plan-of-action.md                     the plan this guide explains
+│   ├── 01-discovery-request.md                  21 questions + gates we send Pacific Life
+│   ├── 02-functional-parity-checklist-template  per-app acceptance checklist (FPC)
+│   ├── 03-migration-pattern-runbook.md          step-by-step per app, per runtime
+│   ├── 04-decommission-readiness-pack-outline   the final evidence pack structure
+│   ├── 05-app-register.md                       10 apps, tranches, validation method
+│   ├── 06-exceptions-register.md                weekly exceptions review log
+│   ├── 07-rda-review-additions.md               added risks/dependencies/assumptions
+│   └── 08-l1-engineer-guide.md                  this document
+├── alloy/
+│   ├── host/config.alloy                        host collector (reference)
+│   └── eks/config.alloy, bt-rules.alloy, values.yaml   regional pipeline + Helm values
+├── terraform/
+│   ├── modules/span-metrics-alerts              health rules
+│   ├── modules/golden-signal-dashboard          dashboards
+│   ├── modules/servicenow-routing               contact point + policy + routing test
+│   └── envs/nonprod/main.tf                     example: APP-01, APP-02 wired up
+├── agents/java.md, dotnet.md, python.md         exact flags/env vars/commands per runtime
+├── azure-pipelines.yml                          CI/CD: validate → plan → apply
+└── docx/                                        Word versions of every doc
+</code></pre>
+<hr />
+<h2>16. Ten things to remember</h2>
+<ol>
+<li>We are replacing the <strong>agent inside the app</strong>, not the apps and not Grafana — Grafana Cloud already exists.</li>
+<li><strong>BT = span-metrics series</strong> (<code>service</code> + <code>span_name</code>). If <code>traces_spanmetrics_*</code> isn't in Mimir, nothing else works.</li>
+<li><strong>.NET can't dual-run.</strong> Validate side-by-side or canary; rollback is a redeploy.</li>
+<li><strong>Parity is defined by the FPC</strong>, not by feelings. Get it approved before touching Tranche 1.</li>
+<li><strong>An alert is parity only if it lands in the same ServiceNow group.</strong> Test per app.</li>
+<li><strong>Everything is code</strong> in Azure DevOps — no clicking in Grafana UI for anything that must survive.</li>
+<li><strong>PII is scrubbed in the EKS pipeline</strong>, the last Pacific Life-controlled hop.</li>
+<li><strong>Tail sampling</strong> saves money but changes what metrics count — decision for Pacific Life.</li>
+<li><strong>AppD Controller stays as fallback until Dec 31</strong> — keep access, use it for the baseline and the agent-removal proof.</li>
+<li><strong>Dec 18 is the last change date</strong> (freeze Dec 21 – Jan 3); draft evidence pack by Nov 27 so the non-renewal decision is informed.</li>
+</ol></body></html>
